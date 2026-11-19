@@ -1,0 +1,43 @@
+[package]
+name = "viewfinder"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "viewfinder"
+path = "src/main.rs"
+
+[dependencies]
+canon = { path = "../canon", version = "0.1.0" }
+eframe = { version = "0.37.0", default-features = false, features = ["accesskit", "default_fonts", "glow"] }
+fast_image_resize = "6.1.0"
+raw-window-handle = "0.6.2"
+shared.workspace = true
+tray-icon = "0.26.1"
+vsr = { path = "../vsr", version = "0.1.0" }
+windows-core.workspace = true
+windows = { workspace = true, features = [
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Devices_Properties",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Gdi",
+    "Win32_Media_MediaFoundation",
+    "Win32_System_Com",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }
+zune-jpeg = "0.5.15"
+
+[dev-dependencies]
+egui_kittest = { version = "0.37.0", features = ["wgpu", "snapshot"] }
+jpeg-encoder = "0.7.1"
+windows = { workspace = true, features = ["Win32_System_ProcessStatus"] }
+winit = { version = "0.30.13", default-features = false }
+
+[lints]
+workspace = true

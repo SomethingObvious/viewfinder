@@ -1,0 +1,857 @@
+//! Safe binding to the VideoSuperRes effect of NVIDIA's Video Effects SDK, RGB24 in and NV12 out.
+//!
+//! The declarations follow `nvVideoEffects.h`, `nvCVImage.h` and `nvCVStatus.h` from
+//! github.com/NVIDIA-Maxine/Maxine-VFX-SDK, and the DLLs come from the `nvidia-vfx` wheel.
+
+use std::ffi::{CStr, c_char, c_void};
+use std::path::Path;
+use std::ptr::null_mut;
+
+use windows::Win32::Foundation::HMODULE;
+use windows::Win32::System::LibraryLoader::{
+    GetProcAddress, LOAD_LIBRARY_SEARCH_DEFAULT_DIRS, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR,
+    LoadLibraryExW,
+};
+use windows::core::{HSTRING, PCSTR};
+
+/// What the effect does to each frame.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Settings {
+    /// `QualityLevel`: 0 bicubic, 1 to 4 AI upscaling, 8 to 11 denoise, 12 to 15 deblur, 16 to 19 clean source, 21 and 23 streaming.
+    pub quality: u32,
+    /// `Strength` from 0 to 1.
+    pub strength: f32,
+    /// Denoise level from 8 to 11 for a pass at the input size before upscaling, 0 for none.
+    /// Denoise modes refuse to change the size, so they can't be the upscaling pass itself.
+    /// Turning it on or off needs a new `SuperRes`, changing the level doesn't.
+    pub denoise: u32,
+}
+
+/// One VideoSuperRes effect with its CUDA stream and GPU buffers, sized once.
+#[derive(Debug)]
+pub struct SuperRes {
+    api: Api,
+    effect: Handle,
+    stream: Stream,
+    /// Effect input, RGBA u8 on the GPU. Boxed because `NvVFX_SetImage` keeps the pointer rather
+    /// than the shallow copy nvVideoEffects.h promises, so the descriptor must not move.
+    src: Box<Image>,
+    /// Effect output in the same layout, boxed for the same reason.
+    dst: Box<Image>,
+    /// The denoise pass and its output at the input size, which the upscaler reads instead of
+    /// `src`. Null and empty when denoise is off.
+    denoise: Handle,
+    clean: Box<Image>,
+    /// The output converted to NV12 on the GPU, so only 1.5 bytes a pixel come back over `PCIe`.
+    nv12: Image,
+    /// GPU staging that `NvCVImage_Transfer` grows once and reuses for the RGB24 upload.
+    tmp: Image,
+    input: (u32, u32),
+    output: (u32, u32),
+}
+
+#[expect(unsafe_code, reason = "the SDK's raw handles aren't Send on their own")]
+#[expect(
+    clippy::non_send_fields_in_send_ty,
+    reason = "the handles belong to CUDA's primary context, which any thread can use"
+)]
+// SAFETY: the effect and stream belong to the CUDA runtime's primary context, which any thread
+// can use, and `&mut self` on every call keeps two threads from using them at once.
+unsafe impl Send for SuperRes {}
+
+impl SuperRes {
+    /// Loads the SDK from `dir`, the folder holding NVIDIA's DLLs, and sets up the effect.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the sizes are unusable, a DLL won't load, or the SDK refuses a step, with the
+    /// call that failed in the message.
+    #[expect(unsafe_code, reason = "every step is a call into NVIDIA's C API")]
+    pub fn new(
+        dir: &Path,
+        input: (u32, u32),
+        output: (u32, u32),
+        settings: Settings,
+    ) -> Result<Self, String> {
+        if input.0 == 0 || input.1 == 0 {
+            return Err("the input frame is empty".into());
+        }
+        if !output.0.is_multiple_of(2) || !output.1.is_multiple_of(2) {
+            return Err(format!(
+                "NV12 needs even sides, got {}x{}",
+                output.0, output.1
+            ));
+        }
+        let mut e = Self {
+            api: Api::load(dir, "nvVFXVideoSuperRes.dll")?,
+            effect: null_mut(),
+            stream: null_mut(),
+            src: Box::new(Image::empty()),
+            dst: Box::new(Image::empty()),
+            denoise: null_mut(),
+            clean: Box::new(Image::empty()),
+            nv12: Image::empty(),
+            tmp: Image::empty(),
+            input,
+            output,
+        };
+        let a = &e.api;
+        // SAFETY: every pointer handed over is a live field of `e`, and Drop releases what succeeded.
+        unsafe {
+            a.check(
+                (a.create_effect)(c"VideoSuperRes".as_ptr(), &raw mut e.effect),
+                "NvVFX_CreateEffect",
+            )?;
+            a.check(
+                (a.stream_create)(&raw mut e.stream),
+                "NvVFX_CudaStreamCreate",
+            )?;
+            a.check(
+                (a.set_u32)(e.effect, c"ImageEncodingMode".as_ptr(), 0),
+                "NvVFX_SetU32(ImageEncodingMode)",
+            )?;
+            a.alloc_rgba(&raw mut *e.src, input)?;
+            a.alloc_rgba(&raw mut *e.dst, output)?;
+            a.alloc_nv12(&raw mut e.nv12, output)?;
+        }
+        let upscale_from = if settings.denoise > 0 {
+            e.add_denoise()?
+        } else {
+            &raw mut *e.src
+        };
+        let a = &e.api;
+        // SAFETY: as above, and `upscale_from` points into a box `e` owns.
+        unsafe {
+            a.check(
+                (a.set_image)(e.effect, c"SrcImage0".as_ptr(), upscale_from),
+                "NvVFX_SetImage(SrcImage0)",
+            )?;
+            a.check(
+                (a.set_image)(e.effect, c"DstImage0".as_ptr(), &raw mut *e.dst),
+                "NvVFX_SetImage(DstImage0)",
+            )?;
+            a.check(
+                (a.set_cuda_stream)(e.effect, c"CudaStream".as_ptr(), e.stream),
+                "NvVFX_SetCudaStream",
+            )?;
+        }
+        e.set(settings)?;
+        // SAFETY: the effect is configured and its images outlive it.
+        unsafe {
+            e.api.check((e.api.load)(e.effect), "NvVFX_Load")?;
+            if !e.denoise.is_null() {
+                e.api
+                    .check((e.api.load)(e.denoise), "NvVFX_Load(denoise)")?;
+            }
+        }
+        Ok(e)
+    }
+
+    /// Sets up the denoise pass at the input size and returns the image it writes, which the
+    /// upscaler reads in place of `src`.
+    #[expect(unsafe_code, reason = "every step is a call into NVIDIA's C API")]
+    fn add_denoise(&mut self) -> Result<*mut Image, String> {
+        let a = &self.api;
+        // SAFETY: every pointer handed over is a live field of `self`, and Drop releases what
+        // succeeded.
+        unsafe {
+            a.check(
+                (a.create_effect)(c"VideoSuperRes".as_ptr(), &raw mut self.denoise),
+                "NvVFX_CreateEffect(denoise)",
+            )?;
+            a.check(
+                (a.set_u32)(self.denoise, c"ImageEncodingMode".as_ptr(), 0),
+                "NvVFX_SetU32(ImageEncodingMode)",
+            )?;
+            a.alloc_rgba(&raw mut *self.clean, self.input)?;
+            a.check(
+                (a.set_image)(self.denoise, c"SrcImage0".as_ptr(), &raw mut *self.src),
+                "NvVFX_SetImage(SrcImage0)",
+            )?;
+            a.check(
+                (a.set_image)(self.denoise, c"DstImage0".as_ptr(), &raw mut *self.clean),
+                "NvVFX_SetImage(DstImage0)",
+            )?;
+            a.check(
+                (a.set_cuda_stream)(self.denoise, c"CudaStream".as_ptr(), self.stream),
+                "NvVFX_SetCudaStream",
+            )?;
+        }
+        Ok(&raw mut *self.clean)
+    }
+
+    /// Upscales one frame of RGB24 rows `stride` bytes apart into limited-range BT.709 NV12.
+    ///
+    /// # Errors
+    ///
+    /// Fails when a buffer is too small for the sizes this was built for, or the SDK or CUDA
+    /// reports an error.
+    #[expect(unsafe_code, reason = "the frame is handed to NVIDIA's C API")]
+    pub fn run(&mut self, rgb: &[u8], stride: usize, nv12: &mut [u8]) -> Result<(), String> {
+        let (iw, ih) = (self.input.0 as usize, self.input.1 as usize);
+        if stride < iw * 3 || rgb.len() < stride * (ih - 1) + iw * 3 {
+            return Err(format!(
+                "RGB buffer of {} bytes with stride {stride} is too small for {iw}x{ih}",
+                rgb.len()
+            ));
+        }
+        self.check_output(nv12)?;
+        let pitch = i32::try_from(stride).map_err(|_| format!("stride {stride} is too big"))?;
+        let a = &self.api;
+        let mut cpu_in = Image::empty();
+        // SAFETY: the CPU image wraps the caller's slice, which the bounds check above covers. The
+        // upload from pageable memory has finished reading it by the time Transfer returns.
+        unsafe {
+            let pixels = rgb.as_ptr().cast_mut().cast();
+            let status = (a.init)(
+                &raw mut cpu_in,
+                iw as u32,
+                ih as u32,
+                pitch,
+                pixels,
+                NVCV_RGB,
+                NVCV_U8,
+                NVCV_CHUNKY,
+                NVCV_CPU,
+            );
+            a.check(status, "NvCVImage_Init")?;
+            let status = (a.transfer)(
+                &raw const cpu_in,
+                &raw mut *self.src,
+                1.0,
+                self.stream,
+                &raw mut self.tmp,
+            );
+            a.check(status, "NvCVImage_Transfer(upload)")?;
+        }
+        self.finish(nv12)
+    }
+
+    /// Upscales the window at `left`, `top` of the frame `g` drew last, without it leaving the GPU.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the window doesn't fit `g`'s frame, `nv12` is the wrong size, or the SDK or
+    /// CUDA reports an error.
+    #[expect(unsafe_code, reason = "the frame is handed to NVIDIA's C API")]
+    pub fn run_from(
+        &mut self,
+        g: &FrameGen,
+        left: u32,
+        top: u32,
+        nv12: &mut [u8],
+    ) -> Result<(), String> {
+        let (iw, ih) = self.input;
+        if left + iw > g.size.0 || top + ih > g.size.1 {
+            return Err(format!(
+                "a {iw}x{ih} window at {left},{top} doesn't fit a {}x{} frame",
+                g.size.0, g.size.1
+            ));
+        }
+        self.check_output(nv12)?;
+        // A view into the generated frame. It owns nothing, so it is never deallocated.
+        let mut view = Image::empty();
+        // SAFETY: the offset stays inside `g.dst` by the check above, and `g` finished drawing
+        // before `draw` returned, so this stream can read it straight away.
+        unsafe {
+            std::ptr::copy_nonoverlapping(&raw const *g.dst, &raw mut view, 1);
+            view.width = iw;
+            view.height = ih;
+            view.pixels = g
+                .dst
+                .pixels
+                .cast::<u8>()
+                .add(top as usize * g.dst.pitch as usize + left as usize * 4)
+                .cast();
+            view.delete_ptr = null_mut();
+            view.delete_proc = None;
+            view.buffer_bytes = 0;
+            let status = (self.api.transfer)(
+                &raw const view,
+                &raw mut *self.src,
+                1.0,
+                self.stream,
+                null_mut(),
+            );
+            self.api
+                .check(status, "NvCVImage_Transfer(generated frame)")?;
+        }
+        self.finish(nv12)
+    }
+
+    fn check_output(&self, nv12: &[u8]) -> Result<(), String> {
+        let (ow, oh) = (self.output.0 as usize, self.output.1 as usize);
+        let needs = (ow * oh * 3).div_euclid(2);
+        if nv12.len() != needs {
+            return Err(format!(
+                "NV12 buffer is {} bytes, {ow}x{oh} needs {needs}",
+                nv12.len(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Runs the effects on `src` and brings the result back as NV12.
+    #[expect(unsafe_code, reason = "the frame comes back through NVIDIA's C API")]
+    fn finish(&mut self, nv12: &mut [u8]) -> Result<(), String> {
+        let (ow, oh) = self.output;
+        let pitch = i32::try_from(ow).map_err(|_| format!("width {ow} is too big"))?;
+        let a = &self.api;
+        let mut cpu_out = Image::empty();
+        // SAFETY: the CPU image wraps `nv12`, whose size `check_output` confirmed, and the
+        // synchronize keeps it borrowed until the download lands.
+        unsafe {
+            if !self.denoise.is_null() {
+                a.check((a.run)(self.denoise, 1), "NvVFX_Run(denoise)")?;
+            }
+            a.check((a.run)(self.effect, 1), "NvVFX_Run")?;
+            let status = (a.transfer)(
+                &raw const *self.dst,
+                &raw mut self.nv12,
+                1.0,
+                self.stream,
+                null_mut(),
+            );
+            a.check(status, "NvCVImage_Transfer(RGB to NV12)")?;
+
+            let pixels = nv12.as_mut_ptr().cast();
+            let status = (a.init)(
+                &raw mut cpu_out,
+                ow,
+                oh,
+                pitch,
+                pixels,
+                NVCV_YUV420,
+                NVCV_U8,
+                NVCV_NV12,
+                NVCV_CPU,
+            );
+            a.check(status, "NvCVImage_Init")?;
+            cpu_out.colorspace = NV12_COLORSPACE;
+            let status = (a.transfer)(
+                &raw const self.nv12,
+                &raw mut cpu_out,
+                1.0,
+                self.stream,
+                null_mut(),
+            );
+            a.check(status, "NvCVImage_Transfer(download)")?;
+            match (a.stream_synchronize)(self.stream) {
+                0 => Ok(()),
+                err => Err(format!(
+                    "cudaStreamSynchronize failed with CUDA error {err}"
+                )),
+            }
+        }
+    }
+
+    /// Changes quality and strength, taking effect on the next frame.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the SDK refuses a setting.
+    #[expect(unsafe_code, reason = "settings go through NVIDIA's C API")]
+    pub fn set(&mut self, settings: Settings) -> Result<(), String> {
+        let a = &self.api;
+        // SAFETY: the effect handle is live and the selectors are NUL-terminated.
+        unsafe {
+            a.check(
+                (a.set_u32)(self.effect, c"QualityLevel".as_ptr(), settings.quality),
+                "NvVFX_SetU32(QualityLevel)",
+            )?;
+            a.check(
+                (a.set_f32)(self.effect, c"Strength".as_ptr(), settings.strength),
+                "NvVFX_SetF32(Strength)",
+            )?;
+            if !self.denoise.is_null() && settings.denoise > 0 {
+                a.check(
+                    (a.set_u32)(self.denoise, c"QualityLevel".as_ptr(), settings.denoise),
+                    "NvVFX_SetU32(QualityLevel)",
+                )?;
+            }
+            Ok(())
+        }
+    }
+}
+
+impl Drop for SuperRes {
+    #[expect(
+        unsafe_code,
+        reason = "the SDK's resources are freed through its C API"
+    )]
+    fn drop(&mut self) {
+        let a = &self.api;
+        // SAFETY: each resource is released once, the effect first since it points at the images.
+        unsafe {
+            if !self.effect.is_null() {
+                (a.destroy_effect)(self.effect);
+            }
+            if !self.denoise.is_null() {
+                (a.destroy_effect)(self.denoise);
+            }
+            for im in [
+                &mut *self.src,
+                &mut *self.dst,
+                &mut *self.clean,
+                &mut self.nv12,
+                &mut self.tmp,
+            ] {
+                (a.dealloc)(im);
+            }
+            if !self.stream.is_null() {
+                (a.stream_destroy)(self.stream);
+            }
+        }
+    }
+}
+
+/// NVIDIA's `VideoFrameGeneration` effect, which draws the frame at any moment between two
+/// others. Frames go in and come out as RGB24 on the CPU at one fixed size.
+#[derive(Debug)]
+pub struct FrameGen {
+    api: Api,
+    effect: Handle,
+    stream: Stream,
+    /// The earlier and later frame, RGBA on the GPU. Boxed for the same reason as in `SuperRes`.
+    pair: [Box<Image>; 2],
+    dst: Box<Image>,
+    tmp: Image,
+    size: (u32, u32),
+}
+
+#[expect(unsafe_code, reason = "the SDK's raw handles aren't Send on their own")]
+#[expect(
+    clippy::non_send_fields_in_send_ty,
+    reason = "the handles belong to CUDA's primary context, which any thread can use"
+)]
+// SAFETY: the same reasoning as for SuperRes.
+unsafe impl Send for FrameGen {}
+
+impl FrameGen {
+    /// Loads the effect from `dir` for frames of `size`. `mode` is 0 low, 1 medium or 2 high
+    /// quality.
+    ///
+    /// # Errors
+    ///
+    /// Fails when a DLL won't load or the SDK refuses a step, with the call that failed in the
+    /// message.
+    #[expect(unsafe_code, reason = "every step is a call into NVIDIA's C API")]
+    pub fn new(dir: &Path, size: (u32, u32), mode: u32) -> Result<Self, String> {
+        let (w, h) = size;
+        let mut g = Self {
+            api: Api::load(dir, "nvVFXVideoFrameGeneration.dll")?,
+            effect: null_mut(),
+            stream: null_mut(),
+            pair: [Box::new(Image::empty()), Box::new(Image::empty())],
+            dst: Box::new(Image::empty()),
+            tmp: Image::empty(),
+            size,
+        };
+        let a = &g.api;
+        // SAFETY: every pointer handed over is a live field of `g`, and Drop releases what succeeded.
+        // The order follows NVIDIA's Python wrapper, which sets the output only after Load.
+        unsafe {
+            a.check(
+                (a.create_effect)(c"VideoFrameGeneration".as_ptr(), &raw mut g.effect),
+                "NvVFX_CreateEffect",
+            )?;
+            a.check(
+                (a.stream_create)(&raw mut g.stream),
+                "NvVFX_CudaStreamCreate",
+            )?;
+            for (im, name) in g.pair.iter_mut().zip([c"SrcImage0", c"SrcImage1"]) {
+                a.alloc_rgba(&raw mut **im, size)?;
+                a.check(
+                    (a.set_image)(g.effect, name.as_ptr(), &raw mut **im),
+                    "NvVFX_SetImage(SrcImage)",
+                )?;
+            }
+            a.check(
+                (a.set_cuda_stream)(g.effect, c"CudaStream".as_ptr(), g.stream),
+                "NvVFX_SetCudaStream",
+            )?;
+            a.check(
+                (a.set_u32)(g.effect, c"InputWidth".as_ptr(), w),
+                "NvVFX_SetU32(InputWidth)",
+            )?;
+            a.check(
+                (a.set_u32)(g.effect, c"InputHeight".as_ptr(), h),
+                "NvVFX_SetU32(InputHeight)",
+            )?;
+            a.check(
+                (a.set_u32)(g.effect, c"Mode".as_ptr(), mode),
+                "NvVFX_SetU32(Mode)",
+            )?;
+            // A webcam never cuts between shots, and a fast hand wave shouldn't be taken for one.
+            a.check(
+                (a.set_u32)(g.effect, c"AutomaticShotChangeDetectionEnabled".as_ptr(), 0),
+                "NvVFX_SetU32(AutomaticShotChangeDetectionEnabled)",
+            )?;
+            a.check((a.load)(g.effect), "NvVFX_Load")?;
+            a.alloc_rgba(&raw mut *g.dst, size)?;
+            a.check(
+                (a.set_image)(g.effect, c"DstImage0".as_ptr(), &raw mut *g.dst),
+                "NvVFX_SetImage(DstImage0)",
+            )?;
+        }
+        Ok(g)
+    }
+
+    /// Uploads RGB24 rows `stride` bytes apart as the earlier (`slot` 0) or later (1) frame.
+    ///
+    /// # Errors
+    ///
+    /// Fails when `slot` isn't 0 or 1, `rgb` is too small, or the SDK reports an error.
+    #[expect(unsafe_code, reason = "the frame is handed to NVIDIA's C API")]
+    pub fn upload(&mut self, slot: usize, rgb: &[u8], stride: usize) -> Result<(), String> {
+        let (w, h) = (self.size.0 as usize, self.size.1 as usize);
+        if stride < w * 3 || rgb.len() < stride * (h - 1) + w * 3 {
+            return Err(format!(
+                "RGB buffer of {} bytes with stride {stride} is too small for {w}x{h}",
+                rgb.len()
+            ));
+        }
+        let pitch = i32::try_from(stride).map_err(|_| format!("stride {stride} is too big"))?;
+        let target = self
+            .pair
+            .get_mut(slot)
+            .ok_or_else(|| format!("slot {slot} isn't 0 or 1"))?;
+        let a = &self.api;
+        let mut cpu = Image::empty();
+        // SAFETY: the bounds check covers the slice, and the transfer finishes before this returns
+        // because uploads from pageable memory are synchronous.
+        unsafe {
+            let status = (a.init)(
+                &raw mut cpu,
+                w as u32,
+                h as u32,
+                pitch,
+                rgb.as_ptr().cast_mut().cast(),
+                NVCV_RGB,
+                NVCV_U8,
+                NVCV_CHUNKY,
+                NVCV_CPU,
+            );
+            a.check(status, "NvCVImage_Init")?;
+            let status = (a.transfer)(
+                &raw const cpu,
+                &raw mut **target,
+                1.0,
+                self.stream,
+                &raw mut self.tmp,
+            );
+            a.check(status, "NvCVImage_Transfer(upload)")
+        }
+    }
+
+    /// Draws the moment `t` of the way from the earlier frame to the later one, `t` strictly
+    /// between 0 and 1, into `rgb` as RGB24 rows `stride` bytes apart.
+    ///
+    /// # Errors
+    ///
+    /// Fails as [`FrameGen::draw`] and [`FrameGen::download`] do.
+    pub fn run(&mut self, t: f32, rgb: &mut [u8], stride: usize) -> Result<(), String> {
+        self.draw(t)?;
+        self.download(rgb, stride)
+    }
+
+    /// Draws the moment `t` and keeps it on the GPU, for `SuperRes::run_from` or `download`.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the SDK or CUDA reports an error.
+    #[expect(unsafe_code, reason = "the effect runs through NVIDIA's C API")]
+    pub fn draw(&mut self, t: f32) -> Result<(), String> {
+        let a = &self.api;
+        // SAFETY: the effect and images are live, and the synchronize means other streams can
+        // read the output as soon as this returns.
+        unsafe {
+            a.check(
+                (a.set_u32)(self.effect, c"FrameMultiplier".as_ptr(), 0),
+                "NvVFX_SetU32(FrameMultiplier)",
+            )?;
+            a.check(
+                (a.set_u32)(self.effect, c"ShotChange".as_ptr(), 0),
+                "NvVFX_SetU32(ShotChange)",
+            )?;
+            a.check(
+                (a.set_f32)(self.effect, c"Timestep".as_ptr(), t.clamp(0.01, 0.99)),
+                "NvVFX_SetF32(Timestep)",
+            )?;
+            a.check((a.run)(self.effect, 1), "NvVFX_Run")?;
+            match (a.stream_synchronize)(self.stream) {
+                0 => Ok(()),
+                err => Err(format!(
+                    "cudaStreamSynchronize failed with CUDA error {err}"
+                )),
+            }
+        }
+    }
+
+    /// Copies the frame `draw` made into `rgb` as RGB24 rows `stride` bytes apart.
+    ///
+    /// # Errors
+    ///
+    /// Fails when `rgb` is too small, or the SDK or CUDA reports an error.
+    #[expect(unsafe_code, reason = "the frame comes back through NVIDIA's C API")]
+    pub fn download(&mut self, rgb: &mut [u8], stride: usize) -> Result<(), String> {
+        let (w, h) = (self.size.0 as usize, self.size.1 as usize);
+        if stride < w * 3 || rgb.len() < stride * (h - 1) + w * 3 {
+            return Err(format!(
+                "RGB buffer of {} bytes with stride {stride} is too small for {w}x{h}",
+                rgb.len()
+            ));
+        }
+        let pitch = i32::try_from(stride).map_err(|_| format!("stride {stride} is too big"))?;
+        let a = &self.api;
+        let mut cpu = Image::empty();
+        // SAFETY: the bounds check covers the slice, and the synchronize keeps `rgb` borrowed
+        // until the download lands.
+        unsafe {
+            let status = (a.init)(
+                &raw mut cpu,
+                w as u32,
+                h as u32,
+                pitch,
+                rgb.as_mut_ptr().cast(),
+                NVCV_RGB,
+                NVCV_U8,
+                NVCV_CHUNKY,
+                NVCV_CPU,
+            );
+            a.check(status, "NvCVImage_Init")?;
+            let status = (a.transfer)(
+                &raw const *self.dst,
+                &raw mut cpu,
+                1.0,
+                self.stream,
+                &raw mut self.tmp,
+            );
+            a.check(status, "NvCVImage_Transfer(download)")?;
+            match (a.stream_synchronize)(self.stream) {
+                0 => Ok(()),
+                err => Err(format!(
+                    "cudaStreamSynchronize failed with CUDA error {err}"
+                )),
+            }
+        }
+    }
+}
+
+impl Drop for FrameGen {
+    #[expect(
+        unsafe_code,
+        reason = "the SDK's resources are freed through its C API"
+    )]
+    fn drop(&mut self) {
+        let a = &self.api;
+        // SAFETY: each resource is released once, the effect first since it points at the images.
+        unsafe {
+            if !self.effect.is_null() {
+                (a.destroy_effect)(self.effect);
+            }
+            let [p, n] = &mut self.pair;
+            for im in [&mut **p, &mut **n, &mut *self.dst, &mut self.tmp] {
+                (a.dealloc)(im);
+            }
+            if !self.stream.is_null() {
+                (a.stream_destroy)(self.stream);
+            }
+        }
+    }
+}
+
+type Handle = *mut c_void;
+
+const CUDA_DEVICE_SCHEDULE_BLOCKING_SYNC: u32 = 0x04;
+type Stream = *mut c_void;
+
+const NVCV_RGB: i32 = 4;
+const NVCV_RGBA: i32 = 6;
+const NVCV_YUV420: i32 = 10;
+const NVCV_U8: i32 = 1;
+const NVCV_CHUNKY: u32 = 0;
+const NVCV_NV12: u32 = 7;
+const NVCV_CPU: u32 = 0;
+const NVCV_GPU: u32 = 1;
+const NVCV_709: u8 = 0x01;
+const NVCV_VIDEO_RANGE: u8 = 0x00;
+const NVCV_CHROMA_COSITED: u8 = 0x00;
+
+/// Media Foundation reads untagged NV12 as BT.709 video range with MPEG-2 chroma siting, which
+/// `NvCV` calls cosited. JPEG RGB and BT.709 share primaries and both carry gamma-encoded values,
+/// so the matrix is all that changes.
+const NV12_COLORSPACE: u8 = NVCV_709 | NVCV_VIDEO_RANGE | NVCV_CHROMA_COSITED;
+
+/// `NvCVImage` from nvCVImage.h.
+#[repr(C)]
+#[derive(Debug)]
+struct Image {
+    width: u32,
+    height: u32,
+    pitch: i32,
+    pixel_format: i32,
+    component_type: i32,
+    pixel_bytes: u8,
+    component_bytes: u8,
+    num_components: u8,
+    planar: u8,
+    gpu_mem: u8,
+    colorspace: u8,
+    reserved: [u8; 2],
+    pixels: *mut c_void,
+    delete_ptr: *mut c_void,
+    delete_proc: Option<unsafe extern "C" fn(*mut c_void)>,
+    buffer_bytes: u64,
+}
+
+const _: () = assert!(size_of::<Image>() == 64);
+
+impl Image {
+    /// The SDK's empty image, all zero.
+    #[expect(unsafe_code, reason = "zeroing a C struct")]
+    const fn empty() -> Self {
+        // SAFETY: every field is an integer, a raw pointer or an optional function pointer, and
+        // all zero is valid for each, which is how the SDK spells an empty image.
+        unsafe { std::mem::zeroed() }
+    }
+}
+
+/// DLLs loaded up front, in dependency order, before the effect's own DLL. `NVVideoEffects` finds
+/// effects only among loaded modules, while `nvngxruntime.dll` and `nvngx_vsr.dll` load from the
+/// same folder on their own. The NPP libraries in the wheel serve other effects.
+const DLLS: [&str; 3] = ["cudart64_12.dll", "NVCVImage.dll", "NVVideoEffects.dll"];
+
+#[derive(Debug)]
+struct Api {
+    create_effect: unsafe extern "C" fn(*const c_char, *mut Handle) -> i32,
+    destroy_effect: unsafe extern "C" fn(Handle),
+    set_u32: unsafe extern "C" fn(Handle, *const c_char, u32) -> i32,
+    set_f32: unsafe extern "C" fn(Handle, *const c_char, f32) -> i32,
+    set_image: unsafe extern "C" fn(Handle, *const c_char, *mut Image) -> i32,
+    set_cuda_stream: unsafe extern "C" fn(Handle, *const c_char, Stream) -> i32,
+    load: unsafe extern "C" fn(Handle) -> i32,
+    run: unsafe extern "C" fn(Handle, i32) -> i32,
+    stream_create: unsafe extern "C" fn(*mut Stream) -> i32,
+    stream_destroy: unsafe extern "C" fn(Stream) -> i32,
+    init: unsafe extern "C" fn(*mut Image, u32, u32, i32, *mut c_void, i32, i32, u32, u32) -> i32,
+    alloc: unsafe extern "C" fn(*mut Image, u32, u32, i32, i32, u32, u32, u32) -> i32,
+    dealloc: unsafe extern "C" fn(*mut Image),
+    transfer: unsafe extern "C" fn(*const Image, *mut Image, f32, Stream, *mut Image) -> i32,
+    error_string: unsafe extern "C" fn(i32) -> *const c_char,
+    stream_synchronize: unsafe extern "C" fn(Stream) -> i32,
+}
+
+impl Api {
+    #[expect(
+        unsafe_code,
+        reason = "loading DLLs and their exports is all raw Win32"
+    )]
+    fn load(dir: &Path, effect: &str) -> Result<Self, String> {
+        let mut libs = [HMODULE::default(); DLLS.len() + 1];
+        for (lib, name) in libs.iter_mut().zip(DLLS.into_iter().chain([effect])) {
+            let path = dir.join(name);
+            // The libraries are never freed. CUDA and NGX keep threads and state that do not survive
+            // an unload, and loading the same path again only bumps the reference count.
+            // SAFETY: plain LoadLibraryExW. These flags resolve each DLL's imports from its own folder
+            // first, without changing the process search path.
+            *lib = unsafe {
+                LoadLibraryExW(
+                    &HSTRING::from(path.as_os_str()),
+                    None,
+                    LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS,
+                )
+            }
+            .map_err(|e| format!("could not load {}: {e}", path.display()))?;
+        }
+        let [cudart, cvimage, vfx, _] = libs;
+        // CUDA spins a core while it waits for the GPU unless told to sleep, which cost 12 ms of
+        // CPU per frame. It only takes before the context exists, so later calls fail harmlessly.
+        // SAFETY: cudaSetDeviceFlags(unsigned int) from cuda_runtime_api.h.
+        unsafe {
+            if let Some(f) = GetProcAddress(cudart, PCSTR(c"cudaSetDeviceFlags".as_ptr().cast())) {
+                let f: unsafe extern "C" fn(u32) -> i32 = std::mem::transmute(f);
+                f(CUDA_DEVICE_SCHEDULE_BLOCKING_SYNC);
+            }
+        }
+        macro_rules! sym {
+            ($lib:expr, $name:literal) => {{
+                // SAFETY: the signature on the field matches the SDK and CUDA headers.
+                let f = unsafe { GetProcAddress($lib, PCSTR(concat!($name, "\0").as_ptr())) }
+                    .ok_or(concat!($name, " is missing from its DLL"))?;
+                #[expect(
+                    clippy::missing_transmute_annotations,
+                    reason = "the Api field gives the type"
+                )]
+                // SAFETY: a function pointer to a function pointer of the header's signature.
+                let f = unsafe { std::mem::transmute(f) };
+                f
+            }};
+        }
+        Ok(Self {
+            create_effect: sym!(vfx, "NvVFX_CreateEffect"),
+            destroy_effect: sym!(vfx, "NvVFX_DestroyEffect"),
+            set_u32: sym!(vfx, "NvVFX_SetU32"),
+            set_f32: sym!(vfx, "NvVFX_SetF32"),
+            set_image: sym!(vfx, "NvVFX_SetImage"),
+            set_cuda_stream: sym!(vfx, "NvVFX_SetCudaStream"),
+            load: sym!(vfx, "NvVFX_Load"),
+            run: sym!(vfx, "NvVFX_Run"),
+            stream_create: sym!(vfx, "NvVFX_CudaStreamCreate"),
+            stream_destroy: sym!(vfx, "NvVFX_CudaStreamDestroy"),
+            init: sym!(cvimage, "NvCVImage_Init"),
+            alloc: sym!(cvimage, "NvCVImage_Alloc"),
+            dealloc: sym!(cvimage, "NvCVImage_Dealloc"),
+            transfer: sym!(cvimage, "NvCVImage_Transfer"),
+            error_string: sym!(cvimage, "NvCV_GetErrorStringFromCode"),
+            stream_synchronize: sym!(cudart, "cudaStreamSynchronize"),
+        })
+    }
+
+    /// Allocates an image in the one layout the effects take, RGBA U8 chunky on the GPU,
+    /// whatever the Python wrapper's float32 interface suggests. The effect's own log says so.
+    ///
+    /// # Safety
+    ///
+    /// `im` must point at a live image that is empty or was allocated by the SDK.
+    #[expect(unsafe_code, reason = "NvCVImage_Alloc writes through a raw pointer")]
+    unsafe fn alloc_rgba(&self, im: *mut Image, (w, h): (u32, u32)) -> Result<(), String> {
+        // SAFETY: the caller vouches for `im`.
+        let status =
+            unsafe { (self.alloc)(im, w, h, NVCV_RGBA, NVCV_U8, NVCV_CHUNKY, NVCV_GPU, 32) };
+        self.check(status, "NvCVImage_Alloc")
+    }
+
+    /// Allocates NV12 on the GPU, tagged with the colourspace apps assume.
+    ///
+    /// # Safety
+    ///
+    /// `im` must point at a live image that is empty or was allocated by the SDK.
+    #[expect(unsafe_code, reason = "NvCVImage_Alloc writes through a raw pointer")]
+    unsafe fn alloc_nv12(&self, im: *mut Image, (w, h): (u32, u32)) -> Result<(), String> {
+        // SAFETY: the caller vouches for `im`.
+        let status =
+            unsafe { (self.alloc)(im, w, h, NVCV_YUV420, NVCV_U8, NVCV_NV12, NVCV_GPU, 0) };
+        self.check(status, "NvCVImage_Alloc")?;
+        // Transfer reads the colourspace only from this field, which Alloc leaves at 0.
+        // SAFETY: Alloc succeeded on the image the caller vouched for.
+        unsafe { (*im).colorspace = NV12_COLORSPACE };
+        Ok(())
+    }
+
+    #[expect(unsafe_code, reason = "the SDK's error text comes back as a C string")]
+    fn check(&self, status: i32, call: &str) -> Result<(), String> {
+        if status == 0 {
+            return Ok(());
+        }
+        // SAFETY: the SDK returns a static string, or null for codes it does not know.
+        let text = unsafe { (self.error_string)(status) };
+        let text = if text.is_null() {
+            "unknown status".into()
+        } else {
+            // SAFETY: not null, and the SDK's strings are static and NUL-terminated.
+            unsafe { CStr::from_ptr(text) }.to_string_lossy()
+        };
+        Err(format!("{call} failed: {text} (NvCV status {status})"))
+    }
+}
