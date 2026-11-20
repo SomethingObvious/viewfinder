@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://somethingobvious.github.io/viewfinder/sitemap.xml

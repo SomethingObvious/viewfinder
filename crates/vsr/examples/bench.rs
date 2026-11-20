@@ -1,5 +1,5 @@
-//! Times every useful quality level on a synthetic JPEG-blocked live view frame and saves
-//! bicubic-versus-mode PNGs. Usage: `bench [dll dir] [png dir]`, or set `VSR_DIR`.
+//! Times every useful quality level on a JPEG blocked frame and saves PNGs against bicubic.
+//! Usage: `bench [dll dir] [png dir]`, or set `VSR_DIR`.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -36,7 +36,7 @@ fn main() -> Result<(), String> {
     for out in OUTPUTS {
         let mut bicubic = Vec::new();
         for mode in MODES {
-            // Denoise and deblur refuse to change the resolution, so they run at the input size.
+            // Denoise and deblur refuse to change the size.
             let size = if (8..=15).contains(&mode) { IN } else { out };
             let mut nv12 = vec![0; (size.0 * size.1 * 3).div_euclid(2) as usize];
 
@@ -107,7 +107,6 @@ fn ms(d: Duration) -> f64 {
     d.as_secs_f64() * 1e3
 }
 
-/// Gradients, a zone plate, digits, fine texture and saturated edges, the things JPEG and upscalers get wrong.
 #[expect(
     clippy::suboptimal_flops,
     reason = "mul_add changes rounding, and the frame must stay the same"
@@ -168,7 +167,6 @@ fn digits(x: i32, y: i32) -> [u8; 3] {
         [0x0E, 0x11, 0x11, 0x0E, 0x11, 0x11, 0x0E],
         [0x0E, 0x11, 0x11, 0x0F, 0x01, 0x02, 0x0C],
     ];
-    // Bands of digits at scales 1, 2 and 3, dark on light like a menu or a page held up to the camera.
     let (scale, top) = match y {
         0..60 => (1, 0),
         60..160 => (2, 60),
@@ -187,7 +185,6 @@ fn digits(x: i32, y: i32) -> [u8; 3] {
 }
 
 const fn texture(x: i32, y: i32) -> [u8; 3] {
-    // Hashed noise with a weave, standing in for hair or fabric that smoothing would erase.
     let n = (x as u32).wrapping_mul(0x9E37_79B1) ^ (y as u32).wrapping_mul(0x85EB_CA77);
     let n = (n ^ (n >> 15)).wrapping_mul(0x2C1B_3C6D) >> 24;
     let weave = if (x + y).rem_euclid(4) < 2 { 30 } else { 0 };
@@ -220,7 +217,6 @@ fn jpeg_round_trip(rgb: &[u8], quality: u8) -> Result<Vec<u8>, String> {
     decoder.decode().map_err(|e| format!("decode: {e}"))
 }
 
-/// Same-size limited-range BT.709 NV12 made on the CPU, so the denoise picture has an untouched twin.
 #[expect(
     clippy::suboptimal_flops,
     reason = "mul_add changes rounding, and the reference must stay the same"
@@ -268,7 +264,6 @@ fn nv12_to_rgb(nv12: &[u8], w: u32, h: u32) -> Result<Vec<u8>, String> {
     Ok(rgb)
 }
 
-/// Two RGB images cropped to `(x, y, w, h)` and put next to each other.
 fn side_by_side(
     left: &[u8],
     right: &[u8],
@@ -300,7 +295,7 @@ fn save_png(path: &Path, width: u32, rgb: &[u8]) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
-/// Free device memory. The first call also creates the CUDA context, so it is not counted.
+/// The first call also creates the CUDA context, so it is not counted.
 #[expect(unsafe_code, reason = "CUDA is reached through a raw function pointer")]
 fn gpu_free(dir: &Path) -> Option<usize> {
     let path = HSTRING::from(dir.join("cudart64_12.dll").as_os_str());

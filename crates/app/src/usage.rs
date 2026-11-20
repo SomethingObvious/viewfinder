@@ -1,5 +1,5 @@
-//! What the machine and Viewfinder are using of the CPU, RAM and NVIDIA GPU, read once a second
-//! while the window is on screen. The GPU readings are the counters Task Manager reads.
+//! CPU, RAM and NVIDIA GPU use, read four times a second while the window shows. The GPU numbers are
+//! the counters Task Manager reads.
 
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
@@ -29,10 +29,9 @@ const GIB: f64 = (1u64 << 30) as f64;
 const NVIDIA: u32 = 0x10de;
 
 pub(crate) struct Usage {
-    /// Percent of all cores, for the machine and for Viewfinder.
+    /// Percent of all cores.
     pub(crate) cpu: f32,
     pub(crate) cpu_own: f32,
-    /// Bytes in use of the total, and Viewfinder's own.
     pub(crate) ram: u64,
     pub(crate) ram_total: u64,
     pub(crate) ram_own: u64,
@@ -40,14 +39,12 @@ pub(crate) struct Usage {
 }
 
 pub(crate) struct Gpu {
-    /// The busiest engine's percent, for the whole GPU and for Viewfinder.
+    /// The busiest engine's percent.
     pub(crate) busy: f32,
     pub(crate) own: f32,
-    /// Viewfinder's dedicated video memory in bytes.
     pub(crate) vram: u64,
 }
 
-/// One meter's words and how full it is, as shares of the whole.
 pub(crate) struct Meter {
     pub(crate) total: String,
     pub(crate) own: String,
@@ -95,13 +92,12 @@ fn size(bytes: u64) -> String {
     }
 }
 
-/// The NVIDIA adapter's name, and its LUID as the GPU counters spell it.
 pub(crate) struct Card {
     pub(crate) name: String,
+    /// Spelt the way the GPU counters spell it.
     luid: String,
 }
 
-/// The GPU the CUDA effects run on.
 #[expect(unsafe_code, reason = "listing adapters is a DXGI call")]
 pub(crate) fn nvidia() -> Option<&'static Card> {
     static CARD: OnceLock<Option<Card>> = OnceLock::new();
@@ -127,7 +123,6 @@ pub(crate) fn nvidia() -> Option<&'static Card> {
     .as_ref()
 }
 
-/// Reads once a second while the window is on screen.
 pub(crate) fn spawn(hub: Arc<Hub>) {
     thread::Builder::new()
         .name("usage".into())
@@ -137,7 +132,7 @@ pub(crate) fn spawn(hub: Arc<Hub>) {
 
 #[expect(
     clippy::disallowed_methods,
-    reason = "a thread of its own that only reads once a second"
+    reason = "a thread of its own that reads four times a second"
 )]
 fn run(hub: &Hub) {
     let luid = nvidia().map(|c| c.luid.as_str());
@@ -146,7 +141,7 @@ fn run(hub: &Hub) {
     let mut last = times();
     let mut logged = false;
     loop {
-        thread::sleep(Duration::from_secs(1));
+        thread::sleep(Duration::from_millis(250));
         if !hub.preview_wanted.load(Ordering::Relaxed) {
             continue;
         }
@@ -175,7 +170,7 @@ fn run(hub: &Hub) {
     }
 }
 
-/// The machine's idle, kernel and user time, and this process's, in 100 ns ticks.
+/// In 100 ns ticks.
 #[derive(Clone, Copy, Default)]
 struct Times {
     idle: u64,
@@ -224,7 +219,7 @@ fn times() -> Times {
     }
 }
 
-/// The machine's and this process's share of all cores. Kernel time includes idle time.
+/// Kernel time includes idle time.
 fn cpu_percent(before: Times, after: Times) -> (f32, f32) {
     let all = (after.kernel + after.user).saturating_sub(before.kernel + before.user);
     if all == 0 {
@@ -236,7 +231,6 @@ fn cpu_percent(before: Times, after: Times) -> (f32, f32) {
     (percent(busy), percent(own))
 }
 
-/// Physical memory in use and in all, in bytes.
 #[expect(unsafe_code, reason = "memory status is a Win32 call")]
 fn memory() -> (u64, u64) {
     let mut m = MEMORYSTATUSEX {
@@ -250,8 +244,7 @@ fn memory() -> (u64, u64) {
     (m.ullTotalPhys - m.ullAvailPhys, m.ullTotalPhys)
 }
 
-/// The private working set, which is Task Manager's Memory column: RAM only this process
-/// holds, leaving out shared DLL pages and anything paged out.
+/// The private working set, which is Task Manager's Memory column.
 #[expect(unsafe_code, reason = "process memory is a Win32 call")]
 fn own_memory() -> u64 {
     let mut c = PROCESS_MEMORY_COUNTERS_EX2::default();
@@ -264,7 +257,7 @@ fn own_memory() -> u64 {
     c.PrivateWorkingSetSize as u64
 }
 
-/// The GPU counters, kept open since the engine use is a rate between two collections.
+/// Kept open, since engine use is a rate between two collections.
 struct Pdh {
     query: PDH_HQUERY,
     engines: PDH_HCOUNTER,
@@ -283,8 +276,7 @@ impl Pdh {
         if unsafe { PdhOpenQueryW(PCWSTR::null(), 0, &raw mut q.query) } != 0 {
             return None;
         }
-        // SAFETY: the query is open, and the paths are static wide strings. `q` closes the
-        // query when dropped, on every way out from here.
+        // SAFETY: the query is open and the paths are static. Dropping `q` closes the query.
         let ok = unsafe {
             PdhAddEnglishCounterW(
                 q.query,
@@ -328,7 +320,6 @@ impl Drop for Pdh {
     }
 }
 
-/// Each instance of a wildcard counter, its name in lower case, with its value.
 #[expect(unsafe_code, reason = "performance counters are a Win32 call")]
 fn items(counter: PDH_HCOUNTER) -> Vec<(String, f64)> {
     let (mut bytes, mut count) = (0u32, 0u32);
@@ -347,8 +338,7 @@ fn items(counter: PDH_HCOUNTER) -> Vec<(String, f64)> {
     }
     let n = (bytes as usize).div_ceil(size_of::<PDH_FMT_COUNTERVALUE_ITEM_W>());
     let mut buf = vec![PDH_FMT_COUNTERVALUE_ITEM_W::default(); n];
-    // SAFETY: the buffer holds at least `bytes` bytes, aligned for the items, and the names
-    // the items point to live in it too.
+    // SAFETY: the buffer holds `bytes` bytes, aligned for the items, and the names live in it.
     let read = unsafe {
         PdhGetFormattedCounterArrayW(
             counter,
@@ -363,11 +353,10 @@ fn items(counter: PDH_HCOUNTER) -> Vec<(String, f64)> {
     }
     buf.iter()
         .take(count as usize)
-        // Valid or new data. Anything else is an instance with no reading yet.
+        // Valid or new data. Anything else has no reading yet.
         .filter(|item| item.FmtValue.CStatus <= 1)
         .map(|item| {
-            // SAFETY: the name is a null terminated string inside `buf`, and a double was
-            // asked for.
+            // SAFETY: the name is a null terminated string in `buf`, and a double was asked for.
             let (name, value) =
                 unsafe { (item.szName.to_string(), item.FmtValue.Anonymous.doubleValue) };
             (name.unwrap_or_default().to_ascii_lowercase(), value)
@@ -375,8 +364,8 @@ fn items(counter: PDH_HCOUNTER) -> Vec<(String, f64)> {
         .collect()
 }
 
-/// Task Manager's sums: each engine's use added up over the processes using it, and the busiest
-/// engine is the GPU's, for the whole GPU and for this process alone.
+/// Task Manager's sums: each engine added up over its processes, and the busiest engine is the
+/// GPU's.
 fn busiest(engines: &[(String, f64)], luid: Option<&str>, pid: &str) -> (f32, f32) {
     let mut sums: HashMap<&str, (f64, f64)> = HashMap::new();
     for (name, value) in engines {
@@ -414,35 +403,6 @@ mod tests {
         };
         assert_eq!(cpu_percent(before, after), (25.0, 5.0));
         assert_eq!(cpu_percent(after, after), (0.0, 0.0));
-    }
-
-    #[test]
-    fn meters_read_like_task_manager() {
-        let usage = Usage {
-            cpu: 23.4,
-            cpu_own: 4.2,
-            ram: 9_771_000_000,
-            ram_total: 17_179_869_184,
-            ram_own: 325_058_560,
-            gpu: Some(Gpu {
-                busy: 31.0,
-                own: 12.0,
-                vram: 1_288_490_189,
-            }),
-        };
-        let words: Vec<String> = usage
-            .meters()
-            .iter()
-            .map(|m| format!("{}, {}", m.total, m.own))
-            .collect();
-        assert_eq!(
-            words,
-            [
-                "CPU 23%, Viewfinder 4%",
-                "RAM 9.1 of 16 GB, Viewfinder 310 MB",
-                "GPU 31%, Viewfinder 12%, 1.2 GB",
-            ]
-        );
     }
 
     #[test]

@@ -25,7 +25,6 @@ fn flat(rgb: [u8; 3]) -> Vec<u8> {
     (0..IN.0 * IN.1).flat_map(|_| rgb).collect()
 }
 
-/// Y, Cb and Cr at the centre of the frame.
 fn centre(nv12: &[u8]) -> Option<[u8; 3]> {
     let (w, h) = (OUT.0 as usize, OUT.1 as usize);
     let uv = w * h + h.div_euclid(4) * w + w.div_euclid(2);

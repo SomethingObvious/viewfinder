@@ -1,17 +1,17 @@
-//! The General settings, and Start with Windows, which is the Run value install.ps1 writes.
+//! The General settings, and Start with Windows, the Run value install.ps1 writes.
 
 use std::time::Duration;
 
 use windows::Win32::Foundation::ERROR_FILE_NOT_FOUND;
 use windows::Win32::System::Registry::{
-    HKEY_CURRENT_USER, REG_SZ, RRF_RT_REG_SZ, RegDeleteKeyValueW, RegGetValueW, RegSetKeyValueW,
+    HKEY_CURRENT_USER, REG_SZ, REG_VALUE_TYPE, RRF_RT_REG_BINARY, RRF_RT_REG_SZ,
+    RegDeleteKeyValueW, RegGetValueW, RegSetKeyValueW,
 };
 use windows::core::HSTRING;
 
 pub(crate) const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const RUN_NAME: &str = "Viewfinder";
 
-/// What the window's Close button does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Close {
     Hide,
@@ -25,7 +25,6 @@ pub(crate) struct Prefs {
     pub close: Close,
     pub on_top: bool,
     pub battery_warning: bool,
-    /// Thirds lines over Preview.
     pub guide: bool,
     /// The restored window's left, top, right and bottom in desktop pixels.
     pub window: Option<[i32; 4]>,
@@ -45,7 +44,6 @@ impl Default for Prefs {
 }
 
 impl Prefs {
-    /// How long the window alone keeps live view up, or None for as long as it's open.
     pub(crate) fn pause(self) -> Option<Duration> {
         (self.pause_after > 0).then(|| Duration::from_secs(u64::from(self.pause_after) * 60))
     }
@@ -108,26 +106,71 @@ fn command() -> Option<String> {
     Some(format!("\"{}\" --background", exe.display()))
 }
 
+/// Task Manager's Startup apps switch, which turns a Run value off without touching it.
+fn approved_key(key: &str) -> String {
+    if key == RUN_KEY {
+        r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run".to_owned()
+    } else {
+        format!("{key} Approved")
+    }
+}
+
+/// Off when Task Manager has the entry turned off, which it marks with an odd first byte.
+#[expect(unsafe_code, reason = "reading the registry is a Win32 call")]
+fn turned_off_in_task_manager(key: &str) -> bool {
+    let mut data = [0u8; 16];
+    let mut size = data.len() as u32;
+    let mut ty = REG_VALUE_TYPE::default();
+    // SAFETY: the names are live wide strings, and `size` says how many bytes `data` holds.
+    let read = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            &HSTRING::from(approved_key(key)),
+            &HSTRING::from(RUN_NAME),
+            RRF_RT_REG_BINARY,
+            Some(&raw mut ty),
+            Some(data.as_mut_ptr().cast()),
+            Some(&raw mut size),
+        )
+    };
+    read.is_ok() && size > 0 && data[0] & 1 == 1
+}
+
+/// Only when the login start runs this copy. One left by another copy shows as off, and
+/// turning it on writes this copy over it.
 #[expect(unsafe_code, reason = "reading the registry is a Win32 call")]
 pub(crate) fn starts_with_windows(key: &str) -> bool {
-    // SAFETY: the names are live wide strings, and no data is asked for.
-    unsafe {
+    let mut text = [0u16; 1024];
+    let mut size = size_of_val(&text) as u32;
+    // SAFETY: the names are live wide strings, and `size` says how many bytes `text` holds.
+    let read = unsafe {
         RegGetValueW(
             HKEY_CURRENT_USER,
             &HSTRING::from(key),
             &HSTRING::from(RUN_NAME),
             RRF_RT_REG_SZ,
             None,
-            None,
-            None,
+            Some(text.as_mut_ptr().cast()),
+            Some(&raw mut size),
         )
-    }
-    .is_ok()
+    };
+    let len = (size as usize).div_euclid(2).saturating_sub(1);
+    read.is_ok()
+        && text.get(..len).is_some_and(|v| {
+            command().is_some_and(|c| String::from_utf16_lossy(v).eq_ignore_ascii_case(&c))
+        })
+        && !turned_off_in_task_manager(key)
 }
 
 #[expect(unsafe_code, reason = "writing the registry is a Win32 call")]
 pub(crate) fn set_starts_with_windows(key: &str, on: bool) -> bool {
+    let approved = HSTRING::from(approved_key(key));
     let (key, name) = (HSTRING::from(key), HSTRING::from(RUN_NAME));
+    // Task Manager's switch goes with it, so turning it on here really turns it on.
+    // SAFETY: the names are live wide strings.
+    unsafe { RegDeleteKeyValueW(HKEY_CURRENT_USER, &approved, &name) }
+        .ok()
+        .ok();
     if !on {
         // SAFETY: the names are live wide strings.
         let removed = unsafe { RegDeleteKeyValueW(HKEY_CURRENT_USER, &key, &name) };
@@ -172,7 +215,6 @@ mod tests {
         assert_eq!(prefs.pause(), None);
     }
 
-    /// Against a made-up key, never the real Run key.
     #[test]
     #[expect(
         unsafe_code,
@@ -206,12 +248,30 @@ mod tests {
         );
         assert_eq!(Some(value.clone()), command());
         assert!(value.ends_with(".exe\" --background"), "{value}");
+        // Turned off in Task Manager, then on again here.
+        let off = [3u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        // SAFETY: the data pointer and byte count describe `off`.
+        unsafe {
+            RegSetKeyValueW(
+                HKEY_CURRENT_USER,
+                &HSTRING::from(approved_key(&key)),
+                &HSTRING::from(RUN_NAME),
+                windows::Win32::System::Registry::REG_BINARY.0,
+                Some(off.as_ptr().cast()),
+                off.len() as u32,
+            )
+        }
+        .ok()
+        .unwrap();
+        assert!(!starts_with_windows(&key), "Task Manager has it off");
+        assert!(set_starts_with_windows(&key, true));
+        assert!(starts_with_windows(&key));
         assert!(set_starts_with_windows(&key, false));
         assert!(!starts_with_windows(&key));
         assert!(set_starts_with_windows(&key, false), "already gone is fine");
         let parent = key.trim_end_matches(r"\Run");
         let parent = HSTRING::from(parent);
-        // SAFETY: the name is a live wide string. This removes the made-up key and all under it.
+        // SAFETY: the name is a live wide string, and only the made-up key goes.
         unsafe { RegDeleteTreeW(HKEY_CURRENT_USER, &parent) }
             .ok()
             .unwrap();

@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="en">
+    <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>Viewfinder: Free Canon EOS Rebel T3 Webcam App for Windows 11</title>
+        <meta name="description" content="A free, open-source app that turns a Canon EOS Rebel T3 or another EOS, PowerShot, Nikon or Sony camera into a Windows 11 webcam for Zoom, Teams, Discord and OBS, with face autofocus and NVIDIA noise reduction.">
+        <link rel="canonical" href="https://somethingobvious.github.io/viewfinder/">
+        <meta name="color-scheme" content="dark">
+        <meta name="theme-color" content="#0a0a0a">
+        <link rel="icon" href="icon.png" type="image/png">
+        <link rel="apple-touch-icon" href="icon.png">
+        <link rel="preload" href="fonts/archivo-expanded-semibold.woff2" as="font" type="font/woff2" crossorigin>
+        <link rel="stylesheet" href="site.css">
+        <meta property="og:type" content="website">
+        <meta property="og:site_name" content="Viewfinder">
+        <meta property="og:title" content="Viewfinder: Free Canon EOS Rebel T3 Webcam App for Windows 11">
+        <meta property="og:description" content="Turn a Canon EOS Rebel T3 or another EOS, PowerShot, Nikon or Sony camera into a Windows 11 webcam. Free and open source.">
+        <meta property="og:url" content="https://somethingobvious.github.io/viewfinder/">
+        <meta property="og:image" content="https://somethingobvious.github.io/viewfinder/og.jpg">
+        <meta property="og:image:width" content="1200">
+        <meta property="og:image:height" content="630">
+        <meta property="og:image:alt" content="The Viewfinder window beside the line Your Canon EOS camera as a Windows webcam.">
+        <meta name="twitter:card" content="summary_large_image">
+        <script type="application/ld+json">
+            {
+                "@context": "https://schema.org",
+                "@type": "SoftwareApplication",
+                "name": "Viewfinder",
+                "description": "A free, open-source Windows 11 webcam app for the Canon EOS Rebel T3 and other EOS, PowerShot, Nikon and Sony cameras, with face autofocus, steady exposure and white balance, and NVIDIA noise reduction and super resolution.",
+                "url": "https://somethingobvious.github.io/viewfinder/",
+                "downloadUrl": "https://github.com/SomethingObvious/viewfinder/releases/latest/download/Viewfinder.zip",
+                "applicationCategory": "MultimediaApplication",
+                "operatingSystem": "Windows 11",
+                "license": "https://opensource.org/license/mit",
+                "isAccessibleForFree": true,
+                "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" },
+                "image": "https://somethingobvious.github.io/viewfinder/og.jpg",
+                "screenshot": [
+                    "https://somethingobvious.github.io/viewfinder/img/window.webp",
+                    "https://somethingobvious.github.io/viewfinder/img/focus.webp",
+                    "https://somethingobvious.github.io/viewfinder/img/setup.webp"
+                ],
+                "author": { "@type": "Organization", "name": "SomethingObvious", "url": "https://github.com/SomethingObvious" }
+            }
+        </script>
+        <script type="application/ld+json">
+            {
+                "@context": "https://schema.org",
+                "@type": "FAQPage",
+                "mainEntity": [
+                    {
+                        "@type": "Question",
+                        "name": "Can I use a Canon EOS Rebel T3 as a webcam?",
+                        "acceptedAnswer": { "@type": "Answer", "text": "Yes. Canon's EOS Webcam Utility leaves the Rebel T3 (EOS 1100D) out, and Viewfinder drives its live view over USB instead, at about 28 frames a second." }
+                    },
+                    {
+                        "@type": "Question",
+                        "name": "Which cameras work with Viewfinder?",
+                        "acceptedAnswer": { "@type": "Answer", "text": "The Canon EOS Rebel T3 first, and other Canon EOS and PowerShot bodies with live view over USB, Nikon and Sony live view, and ordinary webcams." }
+                    },
+                    {
+                        "@type": "Question",
+                        "name": "Do I need an NVIDIA graphics card?",
+                        "acceptedAnswer": { "@type": "Answer", "text": "No. An NVIDIA RTX card adds VideoSuperRes noise reduction and super resolution, and without one the picture is sharpened on the CPU and everything else works the same." }
+                    },
+                    {
+                        "@type": "Question",
+                        "name": "Which apps can use the camera?",
+                        "acceptedAnswer": { "@type": "Answer", "text": "Any app that lists webcams, including Zoom, Microsoft Teams, Google Meet in a browser, Discord and OBS. Pick Viewfinder in the app's camera list." }
+                    }
+                ]
+            }
+        </script>
+    </head>
+    <body>
+        <header class="bar">
+            <a class="mark" href="./" aria-label="Viewfinder home">
+                <img src="icon.png" width="32" height="32" alt="">
+                <span>Viewfinder</span>
+            </a>
+            <a class="quiet" href="https://github.com/SomethingObvious/viewfinder">GitHub</a>
+        </header>
+
+        <main>
+            <section class="hero">
+                <p class="tally"><span aria-hidden="true"></span>On Air</p>
+                <h1>Your Canon EOS Camera as a Windows Webcam</h1>
+                <p class="lede">Viewfinder is a free app that turns a Canon EOS Rebel T3, a camera Canon's EOS Webcam Utility leaves out, into a webcam for Zoom, Teams, Discord, OBS and your browser. It takes other EOS and PowerShot bodies, Nikon and Sony live view, and ordinary webcams too.</p>
+                <div class="actions">
+                    <a class="button" href="https://github.com/SomethingObvious/viewfinder/releases/latest/download/Viewfinder.zip">Download for Windows 11</a>
+                    <a class="button ghost" href="https://github.com/SomethingObvious/viewfinder">Source on GitHub</a>
+                </div>
+                <p class="small">Free and open source under the MIT licence. About 4 MB.</p>
+            </section>
+
+            <figure class="shot">
+                <img src="img/window.webp" width="1600" height="895" alt="The Viewfinder window showing the camera original beside what call apps get, with the frame budget, histogram and processing settings">
+            </figure>
+
+            <section>
+                <h2>What It Does</h2>
+                <ul class="grid">
+                    <li><h3>Drives the Camera</h3><p>Live view over USB with Canon's own commands, at about 28 fps on a T3, with no capture card.</p></li>
+                    <li><h3>Steady Picture</h3><p>Exposure holds still and white balance goes by your skin, so a lamp turning on doesn't turn you orange.</p></li>
+                    <li><h3>Face Autofocus</h3><p>Keeps the biggest face sharp when you lean in or sit back, and puts the lens back where it was next time.</p></li>
+                    <li><h3>Cleaner Frames</h3><p>NVIDIA VideoSuperRes noise reduction and super resolution on RTX cards, and CPU sharpening without one.</p></li>
+                    <li><h3>Stuck Pixel Repair</h3><p>Fills in the hot pixels an older sensor grows as it warms up.</p></li>
+                    <li><h3>Even Frame Rate</h3><p>Apps get a steady frame rate, and a frame the camera missed is filled with the last one.</p></li>
+                    <li><h3>Auto Adjust</h3><p>Exposure, contrast, colour and vignette, set from one press or by hand, with zoom and Auto Frame.</p></li>
+                    <li><h3>Hotkeys</h3><p>Ctrl+Alt+H hides the camera and Ctrl+Alt+F focuses, even while another app is in front.</p></li>
+                </ul>
+            </section>
+
+            <figure class="shot">
+                <img src="img/focus.webp" width="1600" height="895" loading="lazy" alt="The focus settings with Autofocus, Always Focus and Remember Focus turned on">
+            </figure>
+
+            <section>
+                <h2>Install</h2>
+                <ol class="steps">
+                    <li>Download <a href="https://github.com/SomethingObvious/viewfinder/releases/latest/download/Viewfinder.zip">Viewfinder.zip</a> and unzip the whole thing into a folder.</li>
+                    <li>Open <code>viewfinder.exe</code>. It isn't signed, so if Windows says it protected your PC, choose More Info and then Run Anyway.</li>
+                    <li>Press Install in Setup. Windows asks for permission, and Viewfinder copies itself to Program Files and adds its camera to Windows.</li>
+                    <li>With an NVIDIA RTX card, press Download to get NVIDIA's Video Effects, about 436 MB.</li>
+                    <li>Turn the camera on with the mode dial on P, Tv, Av or M, plug it in over USB, and pick Viewfinder in your call app.</li>
+                </ol>
+            </section>
+
+            <figure class="shot">
+                <img src="img/setup.webp" width="1600" height="895" loading="lazy" alt="Setup checking the virtual camera, the camera, other programs, the mode dial and NVIDIA's Video Effects">
+            </figure>
+
+            <section>
+                <h2>Questions</h2>
+                <dl class="faq">
+                    <dt>Can I use a Canon EOS Rebel T3 as a webcam?</dt>
+                    <dd>Yes. Canon's EOS Webcam Utility leaves the Rebel T3 (EOS 1100D) out, and Viewfinder drives its live view over USB instead, at about 28 frames a second.</dd>
+                    <dt>Which cameras work?</dt>
+                    <dd>The Rebel T3 first, and other Canon EOS and PowerShot bodies with live view over USB, Nikon and Sony live view, and ordinary webcams.</dd>
+                    <dt>Do I need an NVIDIA graphics card?</dt>
+                    <dd>No. An RTX card adds noise reduction and super resolution, and without one the picture is sharpened on the CPU and everything else works the same.</dd>
+                    <dt>Which apps can use the camera?</dt>
+                    <dd>Any app that lists webcams, including Zoom, Microsoft Teams, Google Meet in a browser, Discord and OBS.</dd>
+                </dl>
+            </section>
+        </main>
+
+        <footer class="foot">
+            <p>Viewfinder is under the MIT licence and isn't affiliated with Canon, Nikon, Sony or NVIDIA. The Archivo fonts are under the SIL Open Font License.</p>
+        </footer>
+    </body>
+</html>

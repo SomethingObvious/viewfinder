@@ -120,7 +120,6 @@ fn media_type(f: Format) -> Result<IMFMediaType> {
     }
 }
 
-/// Which of [`FORMATS`] a media type asks for.
 #[expect(unsafe_code, reason = "reading attributes is a COM call")]
 fn format_of(ty: &IMFMediaType) -> Result<Format> {
     // SAFETY: `ty` is a live media type and the keys are statics.
@@ -157,9 +156,8 @@ fn fill_placeholder(buf: &mut [u8], f: Format) {
     }
 }
 
-/// Copies a tightly packed frame into a locked 2D buffer. MF lays NV12 out
-/// as the Y rows followed by the UV rows at the same pitch, so both formats
-/// are just `rows` rows of `row` bytes.
+/// Media Foundation lays NV12 out as Y rows then UV rows at the same pitch, so both formats
+/// are `rows` rows of `row` bytes.
 #[expect(unsafe_code, reason = "the destination is a raw locked buffer")]
 fn copy_frame(
     src: &[u8],
@@ -175,19 +173,25 @@ fn copy_frame(
     } else {
         (w, (h * 3).div_euclid(2))
     };
-    let offset = (scan0 as usize).checked_sub(start as usize);
-    let pitch = usize::try_from(pitch).unwrap_or(0);
-    let fits = offset.is_some_and(|o| o + (rows - 1) * pitch + row <= len as usize);
-    if src.len() != row * rows || pitch < row || !fits {
+    // A bottom-up buffer has a negative pitch, with `scan0` on its last row in memory.
+    let (Ok(step), Ok(last)) = (isize::try_from(pitch), isize::try_from(rows - 1)) else {
+        return Err(E_UNEXPECTED.into());
+    };
+    let first = (scan0 as isize).wrapping_sub(start as isize);
+    let end = first + last * step;
+    let fits = first.min(end) >= 0
+        && usize::try_from(first.max(end)).is_ok_and(|e| e + row <= len as usize);
+    if src.len() != row * rows || step.unsigned_abs() < row || !fits {
         return Err(E_UNEXPECTED.into());
     }
     // SAFETY: the check above keeps every row inside the `len` bytes locked at `start`.
     unsafe {
-        if pitch == row {
+        if step == row.cast_signed() {
             std::ptr::copy_nonoverlapping(src.as_ptr(), scan0, src.len());
         } else {
             for (i, line) in src.chunks_exact(row).enumerate() {
-                std::ptr::copy_nonoverlapping(line.as_ptr(), scan0.add(i * pitch), row);
+                let at = scan0.offset(i.cast_signed() * step);
+                std::ptr::copy_nonoverlapping(line.as_ptr(), at, row);
             }
         }
     }
@@ -216,22 +220,31 @@ fn write_sample(sample: &IMFSample, src: &[u8], f: Format) -> Result<()> {
     copied
 }
 
+struct WeakSource(windows_core::Weak<IMFMediaSource>);
+
+impl std::fmt::Debug for WeakSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("WeakSource")
+    }
+}
+
 #[derive(Debug, Default)]
 struct State {
     stream: MF_STREAM_STATE,
     shut: bool,
-    source: Option<IMFMediaSource>,
+    /// Weak, since the source holds this stream and Frame Server can drop a source without
+    /// calling Shutdown, running or not. Readers hold the source themselves.
+    source: Option<WeakSource>,
     allocator: Option<IMFVideoSampleAllocator>,
     format: Option<Format>,
     shared: Option<Shared>,
-    /// Where `read_latest` copies to. A torn read leaves it half written,
-    /// which is why the good frame is kept in `last`.
+    /// A torn read leaves this half written, so the good frame is kept in `last`.
     scratch: Vec<u8>,
     last: Vec<u8>,
-    /// `shared::now_ms` of the last fresh frame.
     fresh_ms: u64,
+    /// When to look for the frame buffer again, if the app hadn't made it at start.
+    retry_ms: u64,
     placeholder: bool,
-    /// Request tokens waiting for their frame slot.
     pending: VecDeque<Option<IUnknown>>,
     /// `MFGetSystemTime` the next frame is due, or 0 to send at once.
     due: i64,
@@ -266,10 +279,17 @@ impl State {
         }
     }
 
-    /// Brings `last` up to date: the newest frame, the previous one for up
-    /// to a second, then the placeholder.
+    /// The newest frame, the previous one for up to a second, then the placeholder.
     fn refresh(&mut self, f: Format) {
         let now = shared::now_ms();
+        if self.shared.is_none() && now >= self.retry_ms {
+            self.retry_ms = now + 1000;
+            self.shared = Shared::create().ok();
+            if let Some(shared) = &self.shared {
+                shared.set_wanted(f);
+                shared.touch_consumer(true);
+            }
+        }
         let fresh = self
             .shared
             .as_ref()
@@ -296,7 +316,6 @@ impl Drop for State {
     }
 }
 
-/// The stream's state and queue, shared with the pacing timer's callback.
 #[derive(Debug)]
 pub struct Inner {
     queue: IMFMediaEventQueue,
@@ -323,13 +342,12 @@ impl Inner {
         self.check().map(drop)
     }
 
-    /// The stream descriptor, which also holds the stream attributes.
     pub fn descriptor(&self) -> IMFStreamDescriptor {
         self.descriptor.clone()
     }
 
-    pub fn set_source(&self, source: IMFMediaSource) {
-        lock(&self.state).source = Some(source);
+    pub fn set_source(&self, source: &IMFMediaSource) {
+        lock(&self.state).source = source.downgrade().ok().map(WeakSource);
     }
 
     pub fn set_allocator(&self, allocator: IMFVideoSampleAllocator) -> Result<()> {
@@ -338,10 +356,11 @@ impl Inner {
             return Err(MF_E_INVALIDREQUEST.into());
         }
         s.allocator = Some(allocator);
+        // A paused stream only rebuilds on a format change, so this makes the restart one.
+        s.format = None;
         Ok(())
     }
 
-    /// Starts streaming `ty`, or switches to it if already running.
     #[expect(
         unsafe_code,
         reason = "the allocator, timer and queue are Win32 and COM calls"
@@ -349,7 +368,7 @@ impl Inner {
     pub fn start(&self, ty: &IMFMediaType, time: i64, event: bool) -> Result<()> {
         let f = format_of(ty)?;
         let mut s = self.check()?;
-        if s.stream != MF_STREAM_STATE_RUNNING || s.format != Some(f) {
+        if s.stream == MF_STREAM_STATE_STOPPED || s.format != Some(f) {
             s.disarm();
             let allocator = if let Some(a) = &s.allocator {
                 a.clone()
@@ -475,7 +494,8 @@ impl Inner {
 
     fn request(&self, token: Option<IUnknown>) -> Result<()> {
         let mut s = self.check()?;
-        if s.stream != MF_STREAM_STATE_RUNNING {
+        // Paused, the request waits in `pending` and `pump` serves it on restart.
+        if s.stream == MF_STREAM_STATE_STOPPED {
             return Err(MF_E_INVALIDREQUEST.into());
         }
         if let Some(shared) = &s.shared {
@@ -485,9 +505,8 @@ impl Inner {
         self.pump(&mut s)
     }
 
-    /// Sends what is due and sets the timer for the rest. Frame Server asks
-    /// again as soon as a sample lands, so without the timer the camera would
-    /// run as fast as the copy. Callers never wait here.
+    /// Frame Server asks again as soon as a sample lands, so without the timer the camera would
+    /// run as fast as the copy.
     #[expect(unsafe_code, reason = "MFGetSystemTime is a Win32 call")]
     fn pump(&self, s: &mut State) -> Result<()> {
         while s.armed.is_none() && s.stream == MF_STREAM_STATE_RUNNING {
@@ -501,8 +520,7 @@ impl Inner {
                 return self.arm(s, s.due - now);
             }
             if self.deliver(s, token.as_ref(), now).is_err() {
-                // Usually the pool is empty because the reader holds every
-                // sample. Try again a frame later rather than lose the token.
+                // Usually the reader holds every pooled sample. Retry a frame later.
                 s.pending.push_front(token);
                 s.due = now + INTERVAL;
             }
@@ -542,8 +560,7 @@ impl Inner {
         let (Some(f), Some(allocator)) = (s.format, s.allocator.clone()) else {
             return Err(E_UNEXPECTED.into());
         };
-        // On schedule, stamp the slot time so consumers see an even 30 fps.
-        // After a gap, restart the schedule from now.
+        // Stamp the slot time so consumers see an even 30 fps, restarting after a gap.
         let time = if s.due == 0 || now - s.due >= INTERVAL {
             now
         } else {
@@ -579,7 +596,6 @@ impl Inner {
     }
 }
 
-/// The COM objects on their own, since everything `#[implement]` generates lands beside them.
 #[expect(
     unsafe_code,
     trivial_casts,
@@ -596,7 +612,6 @@ mod objects {
     use super::Inner;
     use crate::Live;
 
-    /// The one video stream Frame Server pulls samples from.
     #[derive(Debug)]
     #[implement(IMFMediaStream2)]
     pub struct Stream {
@@ -604,8 +619,8 @@ mod objects {
         pub(super) _live: Live,
     }
 
-    /// Fires when the pacing timer comes due. Holds the stream weakly so a
-    /// pending work item never keeps it alive.
+    /// The pacing timer's callback. A weak hold, so a pending work item never keeps the stream
+    /// alive.
     #[derive(Debug)]
     #[implement(IMFAsyncCallback)]
     pub(super) struct Tick {
@@ -618,7 +633,6 @@ pub(crate) use objects::{Stream, Stream_Impl};
 use objects::{Tick, Tick_Impl};
 
 impl Stream {
-    /// Builds the stream descriptor with every media type. Cheap.
     #[expect(unsafe_code, reason = "descriptors and queues are COM calls")]
     pub fn new() -> Result<Self> {
         let types = FORMATS
@@ -667,48 +681,15 @@ impl std::ops::Deref for Stream {
     }
 }
 
-#[expect(
-    unsafe_code,
-    reason = "every method forwards to the event queue's COM methods"
-)]
-impl IMFMediaEventGenerator_Impl for Stream_Impl {
-    fn GetEvent(&self, flags: MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS) -> Result<IMFMediaEvent> {
-        // SAFETY: forwards Frame Server's arguments untouched.
-        guard(|| unsafe { self.queue.GetEvent(flags.0) })
-    }
-
-    fn BeginGetEvent(
-        &self,
-        callback: Ref<'_, IMFAsyncCallback>,
-        state: Ref<'_, IUnknown>,
-    ) -> Result<()> {
-        // SAFETY: forwards Frame Server's arguments untouched.
-        guard(|| unsafe { self.queue.BeginGetEvent(callback.as_ref(), state.as_ref()) })
-    }
-
-    fn EndGetEvent(&self, result: Ref<'_, IMFAsyncResult>) -> Result<IMFMediaEvent> {
-        // SAFETY: forwards Frame Server's arguments untouched.
-        guard(|| unsafe { self.queue.EndGetEvent(result.as_ref()) })
-    }
-
-    fn QueueEvent(
-        &self,
-        met: u32,
-        extended: *const GUID,
-        status: HRESULT,
-        value: *const PROPVARIANT,
-    ) -> Result<()> {
-        // SAFETY: forwards Frame Server's arguments untouched.
-        guard(|| unsafe { self.queue.QueueEventParamVar(met, extended, status, value) })
-    }
-}
+forward_events!(Stream_Impl);
 
 impl IMFMediaStream_Impl for Stream_Impl {
     fn GetMediaSource(&self) -> Result<IMFMediaSource> {
         guard(|| {
             self.check()?
                 .source
-                .clone()
+                .as_ref()
+                .and_then(|w| w.0.upgrade())
                 .ok_or_else(|| MF_E_SHUTDOWN.into())
         })
     }
@@ -774,5 +755,17 @@ mod tests {
         }
         assert!(copy_frame(&src, f, p, pitch32, p, (pitch * 2 + 3) as u32).is_err());
         assert!(copy_frame(&src, f, p, 3, p, dst.len() as u32).is_err());
+
+        let rows = 3;
+        let mut flipped = vec![0xEEu8; pitch * rows];
+        let start = flipped.as_mut_ptr();
+        let top = start.wrapping_add(pitch * (rows - 1));
+        copy_frame(&src, f, top, -pitch32, start, flipped.len() as u32).unwrap();
+        for (row, line) in flipped.chunks(pitch).rev().zip(src.chunks(4)) {
+            assert_eq!(row.get(..4), Some(line));
+        }
+        let short = (pitch * 2) as u32;
+        assert!(copy_frame(&src, f, top, -pitch32, start, short).is_err());
+        assert!(copy_frame(&src, f, start, -pitch32, start, flipped.len() as u32).is_err());
     }
 }

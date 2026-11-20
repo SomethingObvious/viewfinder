@@ -28,7 +28,6 @@ pub(crate) use object::{Source, Source_Impl};
 use crate::stream::Stream;
 use crate::{Live, guard, lock};
 
-/// An empty attribute store.
 #[expect(unsafe_code, reason = "MFCreateAttributes is a COM call")]
 pub(crate) fn new_attributes() -> Result<IMFAttributes> {
     let mut attributes = None;
@@ -37,7 +36,7 @@ pub(crate) fn new_attributes() -> Result<IMFAttributes> {
     attributes.ok_or_else(|| E_POINTER.into())
 }
 
-/// A `VT_I8` PROPVARIANT, the payload of the started and stopped events.
+/// The `VT_I8` payload of the started and stopped events.
 #[expect(unsafe_code, reason = "PROPVARIANT is a C union")]
 pub(crate) fn time_var(time: i64) -> PROPVARIANT {
     let mut var = PROPVARIANT::default();
@@ -53,12 +52,10 @@ pub(crate) fn time_var(time: i64) -> PROPVARIANT {
 #[derive(Debug, Default)]
 struct State {
     shut: bool,
-    /// The stream was selected by an earlier Start, so a later one sends
-    /// `MEUpdatedStream` instead of `MENewStream`.
+    /// Set by an earlier Start, so the next one sends `MEUpdatedStream`.
     active: bool,
 }
 
-/// The source on its own, since everything `#[implement]` generates lands beside it.
 #[expect(
     unsafe_code,
     trivial_casts,
@@ -80,7 +77,6 @@ mod object {
     use crate::Live;
     use crate::stream::Stream;
 
-    /// The media source Frame Server starts and stops.
     #[derive(Debug)]
     #[implement(IMFMediaSourceEx, IMFGetService, IKsControl, IMFSampleAllocatorControl)]
     pub struct Source {
@@ -94,8 +90,7 @@ mod object {
 }
 
 impl Source {
-    /// Builds the source. Frame Server also does this just to list the
-    /// camera, so nothing expensive happens until Start.
+    /// Frame Server also builds one just to list the camera, so nothing expensive happens here.
     #[expect(
         unsafe_code,
         reason = "building the descriptors and profiles is all COM calls"
@@ -135,11 +130,10 @@ impl Source {
             state: Mutex::new(State::default()),
             _live: Live::new(),
         });
-        stream.set_source(source.to_interface::<IMFMediaSourceEx>().into());
+        stream.set_source(&source.to_interface::<IMFMediaSourceEx>().into());
         Ok(source)
     }
 
-    /// True once Shutdown ran, so the activator makes a fresh source.
     pub fn is_shut_down(&self) -> bool {
         lock(&self.state).shut
     }
@@ -158,41 +152,7 @@ impl Source {
     }
 }
 
-#[expect(
-    unsafe_code,
-    reason = "every method forwards to the event queue's COM methods"
-)]
-impl IMFMediaEventGenerator_Impl for Source_Impl {
-    fn GetEvent(&self, flags: MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS) -> Result<IMFMediaEvent> {
-        // SAFETY: forwards Frame Server's arguments untouched.
-        guard(|| unsafe { self.queue.GetEvent(flags.0) })
-    }
-
-    fn BeginGetEvent(
-        &self,
-        callback: Ref<'_, IMFAsyncCallback>,
-        state: Ref<'_, IUnknown>,
-    ) -> Result<()> {
-        // SAFETY: forwards Frame Server's arguments untouched.
-        guard(|| unsafe { self.queue.BeginGetEvent(callback.as_ref(), state.as_ref()) })
-    }
-
-    fn EndGetEvent(&self, result: Ref<'_, IMFAsyncResult>) -> Result<IMFMediaEvent> {
-        // SAFETY: forwards Frame Server's arguments untouched.
-        guard(|| unsafe { self.queue.EndGetEvent(result.as_ref()) })
-    }
-
-    fn QueueEvent(
-        &self,
-        met: u32,
-        extended: *const GUID,
-        status: HRESULT,
-        value: *const PROPVARIANT,
-    ) -> Result<()> {
-        // SAFETY: forwards Frame Server's arguments untouched.
-        guard(|| unsafe { self.queue.QueueEventParamVar(met, extended, status, value) })
-    }
-}
+forward_events!(Source_Impl);
 
 #[expect(
     unsafe_code,
@@ -368,7 +328,6 @@ impl IMFGetService_Impl for Source_Impl {
     }
 }
 
-/// No camera controls, so every property set is unknown.
 fn not_found() -> Result<()> {
     Err(ERROR_SET_NOT_FOUND.to_hresult().into())
 }
@@ -441,5 +400,35 @@ impl IMFSampleAllocatorControl_Impl for Source_Impl {
             }
             Ok(())
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+    use windows::Win32::Media::MediaFoundation::{
+        IMFMediaSource, IMFMediaStream, IMFMediaStream2, MF_VERSION, MFSTARTUP_FULL, MFStartup,
+    };
+    use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx};
+
+    #[test]
+    #[expect(unsafe_code, reason = "Media Foundation is a COM API")]
+    fn a_source_frame_server_never_shuts_down_is_still_freed() {
+        // SAFETY: called on the test thread before any other COM or Media Foundation call.
+        unsafe {
+            CoInitializeEx(None, COINIT_MULTITHREADED).ok().unwrap();
+            MFStartup(MF_VERSION, MFSTARTUP_FULL).unwrap();
+        }
+        let before = crate::LIVE.load(Ordering::Acquire);
+        let source = Source::new(&new_attributes().unwrap()).unwrap();
+        let stream: IMFMediaStream = source.stream.to_interface::<IMFMediaStream2>().into();
+        // SAFETY: a plain COM call on a live stream.
+        let back = unsafe { stream.GetMediaSource() }.unwrap();
+        let ours: IMFMediaSource = source.to_interface::<IMFMediaSourceEx>().into();
+        assert_eq!(back, ours);
+        drop(ours);
+        drop((back, stream, source));
+        assert_eq!(crate::LIVE.load(Ordering::Acquire), before);
     }
 }

@@ -1,24 +1,22 @@
-//! Auto Frame steers the crop so the face sits centred and a third of the way down. When the
-//! face is lost it holds for a moment, then drifts back to the user's own framing.
+//! Auto Frame keeps the face centred and a third of the way down, and drifts back to the user's
+//! framing a moment after the face is lost.
 
 use crate::face::Face;
 
-/// The least zoom Auto Frame works at, in percent, since the whole frame leaves no room to move.
+/// In percent, since the whole frame leaves no room to move.
 pub(crate) const MIN_ZOOM: u32 = 125;
-/// How far the face may stray from its place before the crop follows, as a share of the crop.
+/// As a share of the crop.
 const DEAD_ZONE: f32 = 0.1;
-/// How quickly a move settles, per second. At 5 a move is 96% done after a second.
+/// Per second. At 5 a move is 96% done after a second.
 const PACE: f32 = 5.0;
-/// How long the crop holds once the face is lost, in seconds. The finder already keeps a face
-/// for a second after it was last seen.
+/// Seconds, on top of the second the finder already keeps a face.
 const HOLD: f32 = 1.5;
 
-/// Where the crop is across and down, as pan and framing from 0 to 1.
+/// Pan and framing from 0 to 1.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Steer {
     across: Axis,
     down: Axis,
-    /// Seconds since the face was last seen.
     lost: f32,
 }
 
@@ -38,7 +36,7 @@ impl Steer {
         }
     }
 
-    /// Where the crop goes `dt` seconds on. `own` is the user's pan and framing.
+    /// `own` is the user's pan and framing.
     pub(crate) fn next(
         mut self,
         face: Option<Face>,
@@ -79,8 +77,6 @@ impl Axis {
         }
     }
 
-    /// Heads for where `middle` sits `place` of the way across the crop, once it has strayed
-    /// past the dead zone from where the crop is heading.
     fn follow(&mut self, middle: f32, size: usize, crop: usize, place: f32) {
         let room = size.saturating_sub(crop) as f32;
         if room < 1.0 {
@@ -93,7 +89,7 @@ impl Axis {
         }
     }
 
-    /// A critically damped spring, which starts and stops gently and never overshoots.
+    /// A critically damped spring, so it never overshoots.
     fn ease(&mut self, dt: f32) {
         let change = self.at - self.goal;
         let pull = PACE.mul_add(change, self.speed) * dt;
@@ -112,7 +108,6 @@ mod tests {
     const OWN: (f32, f32) = (0.5, 0.5);
     const TICK: f32 = 1.0 / 30.0;
 
-    /// A 100 pixel face whose middle is at `x`, `y`.
     const fn face(x: usize, y: usize) -> Face {
         Face {
             x: x - 50,

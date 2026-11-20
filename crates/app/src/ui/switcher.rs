@@ -17,21 +17,16 @@ use crate::pipeline::Look;
 use crate::usage;
 use crate::worker::{Command, Status, lock};
 
-/// What one frame may take at the virtual camera's 30 fps.
 const BUDGET_MS: f32 = 1000.0 / 30.0;
-/// Where the frame budget meter tops out.
 const METER_MS: f32 = 40.0;
-/// How long the frame budget's peak holds before it falls back, in seconds.
 const PEAK_HOLD: f64 = 2.0;
-/// How often Preview's still is refreshed while live, in seconds. It's a copy of the decoded
-/// frame on the CPU and leaves the GPU alone.
+/// Seconds. The still is a CPU copy of the decoded frame, so it costs the GPU nothing.
 const STILL_EVERY: f64 = 2.0;
-/// The title bar's height. The caption Windows drags by is the same.
 pub(super) const BAR: f32 = 52.0;
-/// The CPU, RAM and GPU strip under the monitors, always there so they never move. It sits
-/// partly in the margin, so the frame budget keeps room for its legend in the smallest window.
+/// Partly in the margin, so the frame budget keeps room for its legend in the smallest
+/// window.
 const STRIP_H: f32 = 22.0;
-/// The stages as `Status::stage_ms` orders them, with their colour code.
+/// In `Status::stage_ms` order.
 const STAGES: [(&str, Color32); 4] = [
     ("Decode", DECODE),
     ("Repair", REPAIR),
@@ -41,10 +36,8 @@ const STAGES: [(&str, Color32); 4] = [
 
 #[derive(Default)]
 pub(super) struct Bus {
-    /// The levels Denoise and Super Res come back at when switched on again.
     denoise: u32,
     vsr: u32,
-    /// The highest time per frame lately, and when it was seen.
     peak: f32,
     peak_at: f64,
 }
@@ -60,15 +53,12 @@ struct Stage {
     name: &'static str,
     detail: String,
     state: State,
-    /// The stage's colour code, the same as on the frame budget.
     code: Color32,
     toggle: bool,
     hint: String,
 }
 
 impl Bus {
-    /// Keeps the highest total for `PEAK_HOLD` seconds. Nothing is held while there is no
-    /// reading.
     fn hold(&mut self, total: f32, now: f64) {
         if total <= 0.0 || total >= self.peak || now - self.peak_at > PEAK_HOLD {
             (self.peak, self.peak_at) = (total, now);
@@ -91,16 +81,17 @@ impl App {
             Pos2::new(palette.left(), whole.bottom()),
         );
         {
-            // One flat sheet, ruled under the bar and down the settings' edge.
             let p = ui.painter();
             p.rect_filled(whole, 0, GROUND);
             let rule = Stroke::new(finish::hair(p), RULE);
             p.hline(whole.x_range(), p.round_to_pixel_center(bar.bottom()), rule);
-            p.vline(
-                p.round_to_pixel_center(palette.left()),
-                whole.y_range(),
-                rule,
-            );
+            if !self.setup.open {
+                p.vline(
+                    p.round_to_pixel_center(palette.left()),
+                    whole.y_range(),
+                    rule,
+                );
+            }
         }
         // Made in reading order, which is the order Tab takes too.
         let region = |ui: &mut Ui, name: &str, rect: Rect| {
@@ -112,6 +103,12 @@ impl App {
             )
         };
         Self::top_bar(&region(ui, "Title Bar", bar), bar, palette.left(), status);
+        if self.setup.open {
+            let below = whole.with_min_y(bar.bottom() + 1.0);
+            self.setup_sheet(&mut region(ui, "Setup", below), below, status);
+            chrome::window_buttons(ui, whole);
+            return;
+        }
         let inner = mixer.shrink(16.0);
         let strip = inner
             .with_max_y(mixer.bottom() - 8.0)
@@ -129,13 +126,12 @@ impl App {
                 .with_min_x(palette.left() + 1.0)
                 .shrink2(Vec2::new(18.0, 4.0)),
         );
-        // A scrollbar that's always there, so it's plain there is more.
         settings.spacing_mut().scroll = egui::style::ScrollStyle::solid();
         egui::ScrollArea::vertical().show(&mut settings, |ui| {
             ui.add_space(8.0);
             self.camera_row(ui, status);
             self.hide_row(ui, status);
-            Self::processing_section(ui, status, look);
+            self.processing_section(ui, status, look);
             self.picture_section(ui, look);
             self.exposure_section(ui, status);
             self.adjust_section(ui, status, look);
@@ -164,8 +160,6 @@ impl App {
             .min((area.height() - fixed - scopes_min) * 16.0 / 9.0)
             .floor();
         let mon_h = (mon_w * 9.0 / 16.0).round();
-        // Height the monitors can't use goes to the keys first, then the scopes up to a
-        // point, and the rest is shared above and below.
         let chain_h = 58.0 + (area.height() - mon_h - fixed - scopes_max).clamp(0.0, 10.0);
         let scopes_h =
             (area.height() - mon_h - fixed - (chain_h - 58.0)).clamp(scopes_min, scopes_max);
@@ -189,7 +183,6 @@ impl App {
             Vec2::new(width, scopes_h),
         );
 
-        // Hidden puts nothing of the picture on air, so Program isn't lit then either.
         let on_air = status.consumer.is_some() && !status.hidden;
         for mat in [preview, program] {
             ui.painter().rect_filled(mat, 0, MAT);
@@ -225,8 +218,6 @@ impl App {
         );
     }
 
-    /// Preview's name strip with the Compare button, and the still Preview keeps. Returns
-    /// whether Compare is held now, and the frame's time.
     fn preview_strip(&mut self, ui: &mut Ui, bar: Rect, status: &Status) -> (bool, f64) {
         self.monitor_bar(ui, bar, "Preview", |app, ui, text_room| {
             let mut child = ui.new_child(
@@ -238,8 +229,6 @@ impl App {
             (["Camera Original", "Original"], text_room - used - 12.0)
         });
         let comparing = self.hub.compare.load(Ordering::Relaxed);
-        // Preview keeps a still of the camera's own picture, asked for as live view starts
-        // and refreshed every couple of seconds. While Compare is held it comes every frame.
         let now = ui.input(|i| i.time);
         if !status.live {
             self.still_asked = f64::NEG_INFINITY;
@@ -250,7 +239,6 @@ impl App {
         (comparing, now)
     }
 
-    /// Program's name strip, with its tally.
     fn program_strip(&mut self, ui: &mut Ui, bar: Rect, status: &Status) {
         let on_air = status.consumer.is_some() && !status.hidden;
         self.monitor_bar(ui, bar, "Program", |_, ui, text_room| {
@@ -274,7 +262,6 @@ impl App {
         });
     }
 
-    /// Preview's picture: the camera original, live while comparing and a still otherwise.
     fn preview_glass(&self, ui: &Ui, preview_glass: Rect, status: &Status, live_original: bool) {
         let painter = ui.painter_at(preview_glass);
         let shown = self.still.as_ref().filter(|_| status.live);
@@ -285,7 +272,10 @@ impl App {
                 } else {
                     "No Picture"
                 };
-                rest(&painter, preview_glass, &format!("Preview · {state}"));
+                corners(&painter, preview_glass);
+                let title = format!("Preview · {state}");
+                let at = preview_glass.center();
+                finish::label(&painter, at, Align2::CENTER_CENTER, &title, LABEL, FAINT);
                 state
             },
             |t| {
@@ -304,7 +294,6 @@ impl App {
         );
     }
 
-    /// Program's picture, what apps get, or why there is none yet.
     fn program_glass(&self, ui: &mut Ui, program_glass: Rect, status: &Status, on_air: bool) {
         let on_air = if on_air { "On Air" } else { "Off Air" };
         let program = ui.interact(program_glass, Id::unique("program glass"), Sense::hover());
@@ -377,7 +366,7 @@ impl App {
     }
 
     fn scopes(&mut self, ui: &mut Ui, status: &Status, meter: Rect, card: Rect, now: f64) {
-        // The last readings stay in the status after live view stops, but they're stale then.
+        // Readings left in the status after live view stops are stale.
         let stages = if status.live {
             status.stage_ms
         } else {
@@ -400,8 +389,8 @@ impl App {
         );
     }
 
-    /// The name strip under a monitor. `extra` draws whatever sits on the right and returns
-    /// the line under the name, long and short, plus how much width is left for it.
+    /// `extra` draws the right side and returns the line under the name, long and short,
+    /// and the width left for it.
     fn monitor_bar(
         &mut self,
         ui: &mut Ui,
@@ -423,7 +412,7 @@ impl App {
         let fits = |t: &str| {
             ui.fonts_mut(|f| f.layout_no_wrap(t.to_owned(), font.clone(), FAINT).size().x) <= room
         };
-        // A cut-off word reads worse than none, so the line goes when even the short one won't fit.
+        // A cut-off word reads worse than none.
         let what = [what[0], what[1]]
             .into_iter()
             .find(|t| fits(t))
@@ -437,7 +426,6 @@ impl App {
         );
     }
 
-    /// The signal chain from the camera to the app, each processing stage a switch.
     fn chain(&mut self, ui: &Ui, rect: Rect, status: &Status, look: &mut Look) {
         let link = if rect.width() < 640.0 { 6.0 } else { 12.0 };
         let w = ((rect.width() - link * 5.0) / 6.0).floor();
@@ -519,7 +507,6 @@ fn switch(name: &'static str, code: Color32, on: bool, detail: String, hint: &st
     }
 }
 
-/// A stage that can't run, with why in its hint.
 fn fault(name: &'static str, detail: &str, hint: String, toggle: bool) -> Stage {
     Stage {
         name,
@@ -531,7 +518,6 @@ fn fault(name: &'static str, detail: &str, hint: String, toggle: bool) -> Stage 
     }
 }
 
-/// A narrow key takes the short word, since a cut-off one reads worse.
 fn says(short: bool, long: &str, brief: &str) -> String {
     if short {
         brief.to_owned()
@@ -548,14 +534,6 @@ fn level(v: u32, names: &[(u32, &str)]) -> String {
         .to_owned()
 }
 
-fn no_gpu(status: &Status) -> String {
-    status.vsr_problem.clone().unwrap_or_else(|| {
-        "NVIDIA's libraries aren't installed. Run scripts\\install.ps1 to fetch them.".into()
-    })
-}
-
-/// The camera at the head of the chain, a source rather than a switch, coded as Decode since
-/// that is the time it takes.
 fn camera_stage(status: &Status, short: bool) -> Stage {
     match (&status.camera, &status.problem) {
         (None, problem) => Stage {
@@ -591,11 +569,16 @@ fn camera_stage(status: &Status, short: bool) -> Stage {
     }
 }
 
-/// Denoise, Super Res and Smooth, which all run on the NVIDIA GPU.
 fn gpu_stages(status: &Status, look: &Look, short: bool) -> [Stage; 3] {
     let gpu = status.vsr_available && status.vsr_problem.is_none();
     let denoise_levels = [(8, "Low"), (9, "Medium"), (10, "High"), (11, "Ultra")];
     let vsr_levels = [(2, "Fast"), (3, "High"), (4, "Ultra")];
+    let unavailable = |name| {
+        let why = status.vsr_problem.clone().unwrap_or_else(|| {
+            "NVIDIA's Video Effects aren't running. Setup in General says why.".into()
+        });
+        fault(name, &says(short, "Unavailable", "No GPU"), why, false)
+    };
     let (denoise, super_res) = if gpu {
         (
             switch(
@@ -614,41 +597,17 @@ fn gpu_stages(status: &Status, look: &Look, short: bool) -> [Stage; 3] {
             ),
         )
     } else {
-        (
-            fault(
-                "Denoise",
-                &says(short, "Unavailable", "No GPU"),
-                no_gpu(status),
-                false,
-            ),
-            fault(
-                "Super Res",
-                &says(short, "Unavailable", "No GPU"),
-                no_gpu(status),
-                false,
-            ),
-        )
+        (unavailable("Denoise"), unavailable("Super Res"))
     };
-    let smooth = match (gpu, look.smooth, &status.smooth_problem) {
-        (false, _, _) => fault(
-            "Smooth",
-            &says(short, "Unavailable", "No GPU"),
-            no_gpu(status),
-            false,
-        ),
-        (true, true, _) if look.vsr_quality == 0 => fault(
+    let smooth = match (gpu, look.smooth) {
+        (false, _) => unavailable("Smooth"),
+        (true, true) if look.vsr_quality == 0 => fault(
             "Smooth",
             &says(short, "Needs Super Res", "Needs SR"),
             "Smooth Motion needs Super Resolution on.".into(),
             true,
         ),
-        (true, true, Some(p)) => fault(
-            "Smooth",
-            "Failed",
-            format!("Frame generation failed, so frames are paced without it. {p}"),
-            true,
-        ),
-        (true, on, _) => switch(
+        (true, on) => switch(
             "Smooth",
             GPU,
             on,
@@ -657,13 +616,12 @@ fn gpu_stages(status: &Status, look: &Look, short: bool) -> [Stage; 3] {
             } else {
                 "Ready".into()
             },
-            "Paces apps at an even 30 fps with NVIDIA frame generation. Adds about 70 ms of delay.",
+            "Paces apps at an even 30 fps, showing the last frame again when the camera misses one. Adds about 70 ms of delay.",
         ),
     };
     [denoise, super_res, smooth]
 }
 
-/// The virtual camera at the end of the chain, on while an app takes the picture.
 fn output_stage(status: &Status, short: bool) -> Stage {
     let kind = |f: shared::Format| {
         if short {
@@ -702,7 +660,6 @@ fn output_stage(status: &Status, short: bool) -> Stage {
     }
 }
 
-/// Title-safe corners, as a monitor shows with nothing on it.
 fn corners(p: &Painter, rect: Rect) {
     let safe = rect.shrink2(rect.size() * 0.08);
     let arm = (rect.width() * 0.04).clamp(6.0, 12.0);
@@ -718,13 +675,7 @@ fn corners(p: &Painter, rect: Rect) {
     }
 }
 
-fn rest(p: &Painter, rect: Rect, title: &str) {
-    corners(p, rect);
-    finish::label(p, rect.center(), Align2::CENTER_CENTER, title, LABEL, FAINT);
-}
-
-/// A legend and a line of explanation in an empty monitor, with a button under them if there
-/// is one. The explanation shrinks or goes to fit, since the monitor's readout still has it.
+/// The detail shrinks or goes to fit, since the readout still carries it.
 fn notice(ui: &mut Ui, rect: Rect, title: &str, detail: &str, button: Option<&str>) -> bool {
     corners(ui.painter(), rect);
     let room = rect
@@ -756,10 +707,7 @@ fn notice(ui: &mut Ui, rect: Rect, title: &str, detail: &str, button: Option<&st
     let mut y = (room.center().y - h / 2.0).max(room.top()).round();
     y += heading.size().y;
     p.galley(
-        Pos2::new(
-            room.center().x + finish::trail(&heading) / 2.0,
-            y - heading.size().y,
-        ),
+        Pos2::new(room.center().x, y - heading.size().y),
         heading,
         INK,
     );
@@ -790,7 +738,6 @@ const fn flip(value: &mut u32, last: &mut u32, default: u32) {
     }
 }
 
-/// Draws the texture as large as it fits in `rect`, and says where it went.
 pub(super) fn fit(painter: &Painter, rect: Rect, t: &TextureHandle) -> Rect {
     let [w, h] = t.size();
     let scale = (rect.width() / w as f32).min(rect.height() / h as f32);
@@ -804,7 +751,6 @@ pub(super) fn fit(painter: &Painter, rect: Rect, t: &TextureHandle) -> Rect {
     shown
 }
 
-/// The Framing Guide's thirds.
 fn thirds(p: &Painter, rect: Rect) {
     let stroke = Stroke::new(finish::hair(p), FAINT);
     for third in [1.0, 2.0] {
@@ -823,7 +769,6 @@ fn minutes(n: u32) -> String {
     }
 }
 
-/// How the chain's keys set their legends, fitted once so every key matches.
 #[derive(Clone, Copy)]
 struct Face {
     beside: bool,
@@ -876,7 +821,7 @@ impl Face {
             let room = face.pad().mul_add(-2.0, w) - if face.beside { Self::BLOCK } else { 0.0 };
             names.iter().all(|n| {
                 let g = ui.fonts_mut(|f| f.layout_job(face.job(n, INK)));
-                g.size().x - finish::trail(&g) <= room
+                g.size().x <= room
             })
         };
         tries.find(fits).unwrap_or(Self {
@@ -887,7 +832,6 @@ impl Face {
     }
 }
 
-/// A stage as an outlined key. Returns how far it has turned on, for the line between keys.
 fn stage(ui: &Ui, rect: Rect, s: &Stage, face: Face) -> (Response, f32) {
     let sense = if s.toggle {
         Sense::click()
@@ -971,8 +915,6 @@ fn stage_face(ui: &Ui, rect: Rect, s: &Stage, face: Face, ink: Color32) {
     );
 }
 
-/// The hairline between two stages. `t` is how far it's lit, which it is while the picture is
-/// being shaped on both sides. `cut` means the next stage failed.
 #[expect(
     clippy::manual_midpoint,
     reason = "midpoint could round differently, and the drawing must stay the same"
@@ -995,7 +937,6 @@ fn connector(p: &Painter, from: f32, to: f32, y: f32, cut: bool, t: f32) {
     p.line_segment([left, right], Stroke::new(hair, EDGE.lerp_to_gamma(INK, t)));
 }
 
-/// An outlined card with its name in Label type over a Rule. Returns the room under the Rule.
 fn card_frame(p: &Painter, rect: Rect, title: &str) -> Rect {
     finish::outline(p, rect, EDGE);
     finish::label(
@@ -1018,11 +959,8 @@ fn card_frame(p: &Painter, rect: Rect, title: &str) -> Rect {
     )
 }
 
-/// A legend item for the budget meter: a stage's name and time, and its colour code.
 type Item = (Arc<Galley>, Color32);
 
-/// The measured time per frame against what 30 fps allows, split into the stages that took
-/// it, with a peak that holds for a moment.
 fn budget(ui: &Ui, rect: Rect, stages: [f32; 4], total: f32, peak: f32) {
     readout(
         &ui.interact(rect, Id::unique("frame budget"), Sense::hover()),
@@ -1030,7 +968,6 @@ fn budget(ui: &Ui, rect: Rect, stages: [f32; 4], total: f32, peak: f32) {
     );
     let p = ui.painter();
     let inner = card_frame(p, rect, "Frame Budget");
-    // What the budget is, beside the heading, shortened and then left out where it won't fit.
     let heading = p.layout_job(finish::label_job("Frame Budget", LABEL, INK));
     let room = inner.width() - heading.size().x - 12.0;
     if let Some(g) = [
@@ -1048,7 +985,6 @@ fn budget(ui: &Ui, rect: Rect, stages: [f32; 4], total: f32, peak: f32) {
         );
     }
 
-    // The legend's items, laid out first to know how many rows they take.
     let items: Vec<Item> = stages
         .iter()
         .zip(STAGES)
@@ -1074,7 +1010,6 @@ fn budget(ui: &Ui, rect: Rect, stages: [f32; 4], total: f32, peak: f32) {
     let meter_h = 12.0;
     let scale_h = 16.0;
     let show_scale = inner.height() - (reading_h + meter_h + scale_h + legend_h) >= 10.0;
-    // The reading at the top and the legend at the bottom, with the meter centred between.
     let middle = meter_h + if show_scale { scale_h } else { 0.0 };
     let mut y = inner.top();
 
@@ -1107,8 +1042,6 @@ fn budget(ui: &Ui, rect: Rect, stages: [f32; 4], total: f32, peak: f32) {
     }
 }
 
-/// The machine's CPU, RAM and GPU, with Viewfinder's part. A meter's words drop "Viewfinder"
-/// and then its part where they won't fit.
 fn usage_strip(ui: &Ui, rect: Rect) {
     let Some(meters) = lock(&usage::LATEST).as_ref().map(usage::Usage::meters) else {
         return;
@@ -1147,17 +1080,18 @@ fn usage_strip(ui: &Ui, rect: Rect) {
         p.galley(slot.min, fits, INK);
         let track = slot.with_min_y(slot.bottom() - 4.0);
         p.rect_filled(track, 0, ROW_RULE);
-        for (fill, colour) in [(m.fill, EDGE), (m.own_fill, INK)] {
-            let run = track.with_max_x(egui::lerp(
-                track.left()..=track.right(),
+        for (k, (fill, colour)) in [(m.fill, EDGE), (m.own_fill, INK)].into_iter().enumerate() {
+            let fill = glide(
+                ui.ctx(),
+                Id::unique(("usage fill", i, k)),
                 fill.clamp(0.0, 1.0),
-            ));
+            );
+            let run = track.with_max_x(egui::lerp(track.left()..=track.right(), fill));
             p.rect_filled(run, 0, colour);
         }
     }
 }
 
-/// What the frame budget reads out to a screen reader.
 fn budget_words(stages: [f32; 4], total: f32) -> String {
     if total <= 0.0 {
         return "Frame Budget: no reading".into();
@@ -1179,9 +1113,46 @@ fn budget_words(stages: [f32; 4], total: f32) -> String {
     )
 }
 
-/// Breaks the legend's items into rows that fit `width`, with at least one row.
+/// Glides over one reading, so a usage bar climbs and falls instead of stepping. egui's own
+/// animation would redraw at the monitor's rate, and with a reading every 250 ms it would never
+/// stop, so this asks for 30 fps. With Windows animations off it jumps.
+fn glide(ctx: &egui::Context, id: Id, target: f32) -> f32 {
+    const SECONDS: f64 = 0.25;
+    if ctx.global_style().animation_time <= 0.0 {
+        return target;
+    }
+    let now = ctx.input(|i| i.time);
+    let at = |(from, to, start): (f32, f32, f64)| {
+        egui::lerp(from..=to, ((now - start) / SECONDS).clamp(0.0, 1.0) as f32)
+    };
+    let run = ctx.data_mut(|d| {
+        let run = d.get_temp_mut_or_insert_with(id, || (target, target, now));
+        if (run.1 - target).abs() > f32::EPSILON {
+            *run = (at(*run), target, now);
+        }
+        *run
+    });
+    if now - run.2 < SECONDS {
+        ctx.request_repaint_after(std::time::Duration::from_secs_f64(1.0 / 30.0));
+    }
+    at(run)
+}
+
+/// As few rows as fit, then the items shared out evenly, so the last row isn't one orphan.
 fn legend_rows(items: &[Item], width: f32) -> Vec<Vec<Item>> {
     let item_w = |it: &Item| 15.0 + it.0.size().x + 12.0;
+    let greedy = greedy_rows(items, width, item_w);
+    let per = items.len().div_ceil(greedy.len().max(1)).max(1);
+    let even: Vec<Vec<Item>> = items.chunks(per).map(<[Item]>::to_vec).collect();
+    let fits = |row: &Vec<Item>| row.iter().map(item_w).sum::<f32>() <= width + 12.0;
+    if even.len() == greedy.len() && even.iter().all(fits) {
+        even
+    } else {
+        greedy
+    }
+}
+
+fn greedy_rows(items: &[Item], width: f32, item_w: impl Fn(&Item) -> f32) -> Vec<Vec<Item>> {
     let mut rows = vec![Vec::new()];
     let mut x = 0.0;
     for it in items {
@@ -1197,8 +1168,6 @@ fn legend_rows(items: &[Item], width: f32) -> Vec<Vec<Item>> {
     rows
 }
 
-/// The total time per frame, and what's spare or over on the right. "per frame" goes when the
-/// two sides would meet.
 fn reading(p: &Painter, inner: Rect, y: f32, reading_h: f32, total: f32) {
     let small = |t: &str| p.layout_no_wrap(t.to_owned(), FontId::proportional(12.0), FAINT);
     let big = p.layout_no_wrap(
@@ -1244,7 +1213,6 @@ fn meter_x(meter: Rect, t: f32) -> f32 {
     meter.left() + meter.width() * t.clamp(0.0, METER_MS) / METER_MS
 }
 
-/// The meter's scale in milliseconds, every 10 ms, under it at `y`.
 fn scale(p: &Painter, meter: Rect, y: f32) {
     let top = METER_MS as u32;
     for t in (0..=top).step_by(10) {
@@ -1269,8 +1237,7 @@ fn scale(p: &Painter, meter: Rect, y: f32) {
     }
 }
 
-/// The time per frame in the stages' colour codes, past the budget in Warn, with the held peak
-/// as a tick. Without a split only the total was measured, so the run is one grey.
+/// Without a split only the total was measured, so the run is one grey.
 fn meter_run(p: &Painter, rect: Rect, stages: [f32; 4], total: f32, peak: f32) {
     p.rect_filled(rect, 0, MAT);
     finish::outline(p, rect, RULE);
@@ -1318,16 +1285,16 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
 
-    use eframe::egui::{Key, TextureHandle, Vec2};
+    use std::sync::atomic::Ordering;
+
+    use eframe::egui::{Event, Key, Modifiers, PointerButton, TextureHandle, Vec2};
+    use egui_kittest::kittest::Queryable;
     use shared::{Format, NV12};
 
     use super::super::{App, style};
-    use super::Bus;
     use crate::pipeline::Look;
     use crate::worker::{Hub, lock};
 
-    /// A ramp for the processed picture and a checkerboard for the original, so the two
-    /// monitors can be told apart in a render.
     fn frame(hub: &Hub, original: bool) {
         let (width, height) = (320usize, 180usize);
         let rgba = (0..width * height)
@@ -1354,8 +1321,6 @@ mod tests {
         }
     }
 
-    /// Holds Compare and lets it go, checking Program keeps the processed picture while
-    /// Preview gets the original.
     #[test]
     fn compare_keeps_both_pictures() {
         let hub = Hub::new(Look::default());
@@ -1391,7 +1356,7 @@ mod tests {
             .map(TextureHandle::id)
             .expect("processed texture");
         assert!(
-            hub.want_original.load(std::sync::atomic::Ordering::Relaxed),
+            hub.want_original.load(Ordering::Relaxed),
             "Preview asks for a still as live view starts"
         );
 
@@ -1415,18 +1380,53 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::float_cmp,
-        reason = "the peak is a copy of a reading, so it matches exactly"
-    )]
-    fn peak_holds_then_falls() {
-        let mut bus = Bus::default();
-        bus.hold(30.0, 0.0);
-        bus.hold(15.0, 1.0);
-        assert_eq!(bus.peak, 30.0, "held within two seconds");
-        bus.hold(15.0, 2.1);
-        assert_eq!(bus.peak, 15.0, "falls back after two seconds");
-        bus.hold(0.0, 2.2);
-        assert_eq!(bus.peak, 0.0, "nothing held once live view stops");
+    fn compare_stays_held_past_a_click() {
+        let hub = Hub::new(Look::default());
+        lock(&hub.status).live = true;
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let app = App::with_context(
+            &eframe::egui::Context::default(),
+            hub.clone(),
+            tx,
+            Arc::new(AtomicBool::new(false)),
+            true,
+        );
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(Vec2::new(860.0, 520.0))
+            .with_step_dt(0.1)
+            .with_context_setup(style)
+            .build_ui_state(|ui, app: &mut App| app.draw(ui), app);
+        harness.run();
+        let at = harness.get_by_label("Hold to Compare").rect().center();
+        harness.hover_at(at);
+        harness.event(Event::PointerButton {
+            pos: at,
+            button: PointerButton::Primary,
+            pressed: true,
+            modifiers: Modifiers::NONE,
+        });
+        for _ in 0..30 {
+            harness.step();
+        }
+        assert!(hub.compare.load(Ordering::Relaxed), "still held after 3 s");
+    }
+
+    #[test]
+    fn usage_bars_glide_unless_animations_are_off() {
+        let ctx = eframe::egui::Context::default();
+        let id = eframe::egui::Id::unique("bar");
+        let mut seen = Vec::new();
+        for (time, target) in [(0.0, 0.2), (1.0, 0.8), (1.125, 0.8), (1.5, 0.8)] {
+            let input = eframe::egui::RawInput {
+                time: Some(time),
+                ..Default::default()
+            };
+            drop(ctx.run_ui(input, |ui| seen.push(super::glide(ui.ctx(), id, target))));
+        }
+        assert_eq!(seen, [0.2, 0.2, 0.5, 0.8]);
+        ctx.all_styles_mut(|s| s.animation_time = 0.0);
+        drop(ctx.run_ui(eframe::egui::RawInput::default(), |ui| {
+            assert!((super::glide(ui.ctx(), id, 0.1) - 0.1).abs() < f32::EPSILON);
+        }));
     }
 }

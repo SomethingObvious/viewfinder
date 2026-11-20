@@ -22,7 +22,6 @@ pub(crate) const RC_CANON_NOT_READY: u16 = 0xA102;
 const EC_PROP_VALUE_CHANGED: u32 = 0xC189;
 const EC_AVAIL_LIST_CHANGED: u32 = 0xC18A;
 
-/// The name of a PTP response code, or "" for one this crate doesn't know.
 pub(crate) const fn response_name(code: u16) -> &'static str {
     match code {
         0x2001 => "OK",
@@ -85,8 +84,7 @@ pub enum Prop {
     ExposureSim,
     /// 0xD1BA, live view AF method, see `values::af_method_label`.
     AfMethod,
-    /// 0xD1C1, Auto Lighting Optimizer. Both low bytes hold its strength, 3 being off, and
-    /// bit 16 keeps it working in M (`canon_eos_alomode` in config.c).
+    /// 0xD1C1, Auto Lighting Optimizer, where bit 16 keeps it on in M (`canon_eos_alomode`).
     Alo,
 }
 
@@ -189,7 +187,6 @@ fn read_le(d: &[u8], width: usize) -> Option<u32> {
     Some(b.iter().rev().fold(0, |v, &x| (v << 8) | u32::from(x)))
 }
 
-/// One decoded `GetEvent` record.
 #[derive(Debug, PartialEq, Eq)]
 #[expect(
     variant_size_differences,
@@ -197,14 +194,12 @@ fn read_le(d: &[u8], width: usize) -> Option<u32> {
 )]
 pub(crate) enum Event<'a> {
     Value(Prop, u32),
-    /// Allowed values, 4 bytes each.
+    /// 4 bytes a value.
     Allowed(Prop, &'a [u8]),
-    /// A property this crate has no name for, with its first four value bytes.
     Unnamed(u16, u32),
     Other,
 }
 
-/// Walks the records of a `GetEvent` (0x9116) reply.
 pub(crate) const fn events(data: &[u8]) -> Events<'_> {
     Events { data }
 }
@@ -219,8 +214,7 @@ impl<'a> Iterator for Events<'a> {
     fn next(&mut self) -> Option<Event<'a>> {
         let size = u32_at(self.data, 0)? as usize;
         let code = u32_at(self.data, 4)?;
-        // Same stop rules as ptp_unpack_EOS_events: a size under 8, one past the end, or the
-        // 8-byte zero record ends the chain.
+        // The same stop rules as ptp_unpack_EOS_events.
         if size < 8 || size > self.data.len() || (size == 8 && code == 0) {
             self.data = &[];
             return None;
@@ -254,8 +248,7 @@ fn decode(code: u32, record: &[u8]) -> Event<'_> {
             .and_then(|d| read_le(d, prop.width()))
             .map_or(Event::Other, |v| Event::Value(prop, v));
     }
-    // Only list type 3 is an enumeration, and each entry takes 4 bytes whatever the property
-    // width (ptp_unpack_EOS_events, AvailListChanged case).
+    // Only list type 3 is an enumeration, 4 bytes an entry whatever the width (gphoto).
     if u32_at(record, 12) != Some(3) {
         return Event::Other;
     }
@@ -268,7 +261,6 @@ fn decode(code: u32, record: &[u8]) -> Event<'_> {
     }
 }
 
-/// Decodes an `Event::Allowed` list into values masked to the property's width.
 pub(crate) fn allowed_values(prop: Prop, list: &[u8]) -> impl Iterator<Item = u32> + '_ {
     list.as_chunks::<4>()
         .0
@@ -276,7 +268,6 @@ pub(crate) fn allowed_values(prop: Prop, list: &[u8]) -> impl Iterator<Item = u3
         .map(move |&c| u32::from_le_bytes(c) & prop.mask())
 }
 
-/// Finds the live view JPEG in a `GetViewFinderData` (0x9153) reply.
 pub(crate) fn viewfinder_jpeg(mut data: &[u8]) -> Option<&[u8]> {
     while let (Some(len), Some(kind)) = (u32_at(data, 0), u32_at(data, 4)) {
         // A zero length would spin forever, and camera_capture_preview has no guard for it.
@@ -300,7 +291,6 @@ pub(crate) fn viewfinder_jpeg(mut data: &[u8]) -> Option<&[u8]> {
     None
 }
 
-/// Builds the 12-byte `SetDevicePropValueEx` (0x9110) data phase for a scalar property.
 pub(crate) fn set_prop_payload(prop: Prop, value: u32) -> [u8; 12] {
     let mut b = [0; 12];
     b[0..4].copy_from_slice(&12u32.to_le_bytes());
@@ -309,7 +299,6 @@ pub(crate) fn set_prop_payload(prop: Prop, value: u32) -> [u8; 12] {
     b
 }
 
-/// The parts of a PTP `DeviceInfo` dataset this crate uses.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct DeviceInfo {
     pub model: String,
@@ -356,7 +345,6 @@ impl Reader<'_> {
     }
 }
 
-/// Parses a `GetDeviceInfo` (0x1001) dataset up to the model string.
 pub(crate) fn parse_device_info(d: &[u8]) -> Option<DeviceInfo> {
     let mut r = Reader { d };
     r.take(8)?;
@@ -371,7 +359,7 @@ pub(crate) fn parse_device_info(d: &[u8]) -> Option<DeviceInfo> {
     Some(DeviceInfo { model, ops })
 }
 
-/// Reads a JPEG's width and height from its SOF marker without decoding it.
+/// A JPEG's width and height from its SOF marker.
 #[must_use]
 pub fn jpeg_size(d: &[u8]) -> Option<(u16, u16)> {
     if !d.starts_with(&[0xFF, 0xD8]) {

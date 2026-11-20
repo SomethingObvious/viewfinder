@@ -34,17 +34,13 @@ const CANON_VID: &str = "vid_04a9";
 const EOS_1100D_PID: &str = "pid_3217";
 const EVF_TFT: u32 = 1;
 const EVF_PC: u32 = 2;
-/// A 6D announces `EVFOutputDevice` as 0x80000002 before 2, so the top bit is a transition flag
-/// (FC.SDK, "Live view output is a bit mask").
+/// A 6D announces 0x80000002 before 2, so the top bit is a transition flag.
 const EVF_TRANSITION: u32 = 0x8000_0000;
 const KEEP_ALIVE: Duration = Duration::from_secs(10);
-/// Auto Lighting Optimizer's strength when it's off, in both low bytes.
 const ALO_OFF: u32 = 0x0303;
 
-/// The value that turns Auto Lighting Optimizer off, or None if it's off already or the
-/// value isn't one this understands. Newer bodies repeat the strength in both low bytes
-/// (0x0202), older ones like the T3 send it alone (2). Either way 0 is standard, 1 low,
-/// 2 strong and 3 off.
+/// Newer bodies repeat the strength in both low bytes (0x0202), older ones like the T3 send it
+/// alone (2). 0 is standard, 1 low, 2 strong and 3 off.
 fn alo_off_value(alo: u32, allowed: &[u32]) -> Option<u32> {
     let strength = alo & 0xFF;
     let single = alo <= 0xFF && allowed.iter().all(|&v| v <= 0xFF);
@@ -73,43 +69,42 @@ fn alo_off_value(alo: u32, allowed: &[u32]) -> Option<u32> {
 }
 
 const MAX_DRAIN: usize = 64;
-/// Checking events costs a round trip, and doing it every frame cost the T3 about 2 fps.
-/// Every 10th is still three times a second.
+/// Draining events every frame cost the T3 about 2 fps.
 const DRAIN_EVERY: u32 = 10;
 
 /// What went wrong talking to the camera.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
-    /// No Canon camera is visible to Windows Portable Devices.
+    /// No Canon on WPD.
     NotFound,
-    /// The camera went away. Drop this `Camera` and call `Camera::open` again.
+    /// The camera went away.
     Disconnected,
-    /// The camera answered an operation with a PTP response code other than OK.
+    /// The camera refused an operation.
     Ptp {
         /// The PTP operation code.
         op: u16,
-        /// The response code the camera sent back.
+        /// The PTP response code.
         code: u16,
     },
-    /// Windows failed an operation with this HRESULT.
+    /// Windows failed an operation.
     Wpd {
         /// The PTP operation code.
         op: u16,
-        /// What Windows Portable Devices returned.
+        /// The HRESULT.
         hresult: i32,
     },
-    /// The camera hasn't announced this property, so it can't be set.
+    /// The camera hasn't announced this property.
     Unannounced(Prop),
-    /// The value isn't in the camera's current allowed list for the property.
+    /// The value isn't in the camera's allowed list.
     NotAllowed {
-        /// The property being set.
+        /// The property.
         prop: Prop,
-        /// The value the camera wouldn't take.
+        /// The refused value.
         value: u32,
     },
-    /// An argument was outside the range the operation accepts.
+    /// An argument was out of range.
     OutOfRange,
-    /// The calling thread is in a single-threaded COM apartment.
+    /// The calling thread is in an STA.
     WrongApartment,
 }
 
@@ -196,11 +191,10 @@ const fn check(op: u16, code: u16) -> Result<()> {
 pub enum Frame {
     /// A JPEG is in the caller's buffer.
     Jpeg,
-    /// The camera has no frame yet, which is normal for a second or so after live view starts.
+    /// No frame yet, normal for a second or so after live view starts.
     NotReady,
 }
 
-/// Keeps the process MTA alive for as long as a `Camera` exists.
 #[derive(Debug)]
 struct Mta(CO_MTA_USAGE_COOKIE);
 
@@ -234,7 +228,6 @@ struct Entry {
     allowed: Vec<u32>,
 }
 
-/// Picks the camera's `PnP` id, preferring the EOS 1100D over any other Canon.
 fn pick(ids: &[String]) -> Option<&String> {
     let has = |id: &String, part: &str| id.to_ascii_lowercase().contains(part);
     ids.iter()
@@ -242,16 +235,13 @@ fn pick(ids: &[String]) -> Option<&String> {
         .or_else(|| ids.iter().find(|id| has(id, CANON_VID)))
 }
 
-/// Whether a Canon camera is on and plugged in, by WPD's device list.
+/// Whether a Canon is on and plugged in.
 #[must_use]
 pub fn present() -> bool {
     wpd::device_ids().is_ok_and(|ids| pick(&ids).is_some())
 }
 
-/// A Canon EOS camera opened through Windows Portable Devices.
-///
-/// Every call must come from an MTA thread or one that hasn't initialized COM, since `open`
-/// keeps the MTA alive.
+/// A Canon EOS body on WPD, used only from MTA threads or ones without COM.
 #[derive(Debug)]
 pub struct Camera {
     wpd: wpd::Wpd,
@@ -264,9 +254,7 @@ pub struct Camera {
     frame: Vec<u8>,
     last_ping: Instant,
     evf_rest: u32,
-    /// The camera's own Auto Lighting Optimizer setting, while live view runs with it off.
     alo_rest: Option<u32>,
-    /// The camera's own white balance and colour temperature, while the app holds its own.
     wb_rest: Option<(u32, Option<u32>)>,
     live: bool,
     closed: bool,
@@ -286,12 +274,9 @@ pub struct Camera {
 unsafe impl Send for Camera {}
 
 impl Camera {
-    /// Opens the first Canon on WPD in remote mode, with its property cache filled.
-    ///
+    /// Opens the first Canon on WPD in remote mode.
     /// # Errors
-    ///
-    /// Fails with [`Error::NotFound`] when no Canon is plugged in, [`Error::WrongApartment`] on
-    /// an STA thread, or with what the camera or Windows answered while setting up.
+    /// When no Canon is plugged in, on an STA thread, or when setup fails.
     pub fn open() -> Result<Self> {
         let mta = Mta::enter()?;
         let ids = wpd::device_ids().map_err(wpd_err(0))?;
@@ -299,10 +284,8 @@ impl Camera {
         Self::open_with(id, mta)
     }
 
-    /// Opens the body with this WPD `PnP` id, as [`Camera::open`] does.
-    ///
+    /// Opens the body with this WPD `PnP` id.
     /// # Errors
-    ///
     /// As for [`Camera::open`].
     pub fn open_at(pnp_id: &str) -> Result<Self> {
         Self::open_with(pnp_id, Mta::enter()?)
@@ -370,7 +353,7 @@ impl Camera {
         if let Some(mode) = quirks::remote_mode(&self.model, &self.ops) {
             let code = self.call(OP_SET_REMOTE_MODE, &[mode])?;
             if code == RC_SESSION_NOT_OPEN {
-                // WPD normally opens the session itself. If it hasn't, open one and go again.
+                // WPD normally opens the session itself.
                 self.call(OP_OPEN_SESSION, &[1])?;
                 self.call_ok(OP_SET_REMOTE_MODE, &[mode])?;
             } else {
@@ -412,7 +395,6 @@ impl Camera {
         check(op, self.call(op, params)?)
     }
 
-    /// Calls `GetEvent` until the camera has nothing more to report.
     fn drain(&mut self) -> Result<()> {
         for _ in 0..MAX_DRAIN {
             let code = self
@@ -492,10 +474,8 @@ impl Camera {
     }
 
     /// Starts live view to the PC, as `camera_capture_preview` in library.c does.
-    ///
     /// # Errors
-    ///
-    /// Fails when the camera never announced its live view output or refuses a write.
+    /// When the camera never announced its live view output or refuses a write.
     pub fn start_live_view(&mut self) -> Result<()> {
         if self.get(Prop::EvfMode).is_some_and(|m| m != 1) {
             // "in movie mode we get busy, but can proceed"
@@ -512,8 +492,7 @@ impl Camera {
             .get(Prop::EvfOutput)
             .ok_or(Error::Unannounced(Prop::EvfOutput))?
             & !EVF_TRANSITION;
-        // A body already sending to the PC is left over from an earlier session, so stop falls
-        // back to the rear screen.
+        // A body already sending to the PC was left that way, so stop goes to the rear screen.
         self.evf_rest = if out & EVF_PC != 0 { EVF_TFT } else { out };
         if out & !EVF_TFT == 0 {
             self.write_prop(Prop::EvfOutput, EVF_PC)?;
@@ -530,8 +509,7 @@ impl Camera {
         self.keep_alive()
     }
 
-    /// Turns Auto Lighting Optimizer off for live view, since it shifts brightness with the
-    /// scene even in M. A body that refuses is left as it is.
+    /// Auto Lighting Optimizer shifts brightness with the scene even in M.
     fn alo_off(&mut self) -> Result<()> {
         let Some(alo) = self.get(Prop::Alo) else {
             return Ok(());
@@ -549,11 +527,9 @@ impl Camera {
         }
     }
 
-    /// Pulls one live view frame into `jpeg`, replacing its contents.
-    ///
+    /// Pulls one live view frame into `jpeg`.
     /// # Errors
-    ///
-    /// Fails when the camera is gone or answers with an error other than not ready or busy.
+    /// When the camera is gone or answers with anything but not ready or busy.
     pub fn frame(&mut self, jpeg: &mut Vec<u8>) -> Result<Frame> {
         self.keep_alive()?;
         if self.pulls.is_multiple_of(DRAIN_EVERY) {
@@ -584,34 +560,52 @@ impl Camera {
         }
     }
 
-    /// Stops live view and puts the output back on the rear screen or off.
-    ///
+    /// Stops live view and puts the output back.
     /// # Errors
-    ///
-    /// Fails when the camera is gone or refuses a write.
+    /// When the camera is gone or refuses a write.
     pub fn stop_live_view(&mut self) -> Result<()> {
         self.live = false;
         if self.supports(OP_AF_CANCEL) && self.call(OP_AF_CANCEL, &[]) == Err(Error::Disconnected) {
             return Err(Error::Disconnected);
         }
+        // Every step runs even when one fails, so a busy body still gets its own settings back.
+        let mut first = Ok(());
         if self.get(Prop::EvfOutput).is_some_and(|o| o & EVF_PC != 0) {
-            self.write_prop(Prop::EvfOutput, self.evf_rest)?;
+            let put = self.write_prop(Prop::EvfOutput, self.evf_rest);
+            keep_first(&mut first, put);
         }
-        if self.get(Prop::EvfMode).is_some_and(|m| m != 0) {
-            self.write_prop(Prop::EvfMode, 0)?;
+        if first != Err(Error::Disconnected) && self.get(Prop::EvfMode).is_some_and(|m| m != 0) {
+            let put = self.write_prop(Prop::EvfMode, 0);
+            keep_first(&mut first, put);
         }
-        if let Some(alo) = self.alo_rest.take() {
-            self.write_prop(Prop::Alo, alo)?;
+        if first != Err(Error::Disconnected) {
+            let put = self.put_back();
+            keep_first(&mut first, put);
         }
-        self.restore_white_balance()
+        first
     }
 
-    /// Sets white balance to `wb`, and the colour temperature to `kelvin` if given. The camera's
-    /// own setting is kept the first time, for `restore_white_balance`.
-    ///
+    /// Puts back the camera's own lighting optimizer and white balance. Each is only forgotten
+    /// once its write lands, so a failed write is tried again at close.
+    fn put_back(&mut self) -> Result<()> {
+        let mut first = Ok(());
+        if let Some(alo) = self.alo_rest {
+            let put = self.write_prop(Prop::Alo, alo);
+            if put.is_ok() {
+                self.alo_rest = None;
+            }
+            keep_first(&mut first, put);
+        }
+        if first != Err(Error::Disconnected) {
+            let put = self.restore_white_balance();
+            keep_first(&mut first, put);
+        }
+        first
+    }
+
+    /// Sets white balance and maybe colour temperature, keeping the camera's own to restore.
     /// # Errors
-    ///
-    /// Fails like [`Camera::set`].
+    /// As for [`Camera::set`].
     pub fn hold_white_balance(&mut self, wb: u32, kelvin: Option<u32>) -> Result<()> {
         if self.wb_rest.is_none()
             && let Some(own) = self.get(Prop::WhiteBalance)
@@ -622,27 +616,24 @@ impl Camera {
         kelvin.map_or(Ok(()), |k| self.set(Prop::ColorTemp, k))
     }
 
-    /// Puts back the white balance the camera had before `hold_white_balance`.
-    ///
+    /// Puts back the white balance from before `hold_white_balance`.
     /// # Errors
-    ///
-    /// Fails when the camera is gone or refuses a write.
+    /// When the camera is gone or refuses a write.
     pub fn restore_white_balance(&mut self) -> Result<()> {
-        let Some((wb, kelvin)) = self.wb_rest.take() else {
+        let Some((wb, kelvin)) = self.wb_rest else {
             return Ok(());
         };
         if let Some(k) = kelvin {
             self.write_prop(Prop::ColorTemp, k)?;
         }
-        self.write_prop(Prop::WhiteBalance, wb)
+        self.write_prop(Prop::WhiteBalance, wb)?;
+        self.wb_rest = None;
+        Ok(())
     }
 
-    /// Stops live view if it's running and hands the camera back to its own controls.
-    ///
+    /// Stops live view and hands the camera back to its own controls.
     /// # Errors
-    ///
-    /// Returns the first thing that went wrong. Every step is still tried unless the camera
-    /// is gone.
+    /// The first step that failed. The rest still run unless the camera is gone.
     pub fn close(mut self) -> Result<()> {
         self.shutdown()
     }
@@ -657,7 +648,7 @@ impl Camera {
         let mut first = if self.live {
             self.stop_live_view()
         } else {
-            Ok(())
+            self.put_back()
         };
         if first != Err(Error::Disconnected) && quirks::eos_m(&self.model, &self.ops) {
             let off = self.write_prop(Prop::EvfOutput, 0);
@@ -667,9 +658,14 @@ impl Camera {
             let drained = self.drain();
             first = first.and(drained);
         }
-        // gphoto follows remote mode 0 with 1 and then closes the session. WPD keeps the session
-        // open after this, so a 1 would leave the body in remote mode with nobody keeping it
-        // awake, and a T3 left like that hangs when its auto power off comes round.
+        // A body still busy from leaving live view usually takes the write once it's drained.
+        if first != Err(Error::Disconnected) && (self.alo_rest.is_some() || self.wb_rest.is_some())
+        {
+            let again = self.put_back();
+            keep_first(&mut first, again);
+        }
+        // gphoto follows remote mode 0 with 1, but WPD keeps the session open, so a 1 leaves a
+        // T3 in remote mode to hang when its auto power off comes round.
         for (op, p) in [(OP_SET_REMOTE_MODE, 0), (OP_SET_EVENT_MODE, 0)] {
             if first == Err(Error::Disconnected) {
                 break;
@@ -682,24 +678,21 @@ impl Camera {
         first
     }
 
-    /// The cached value of a property, if the camera has announced it.
+    /// The cached value of a property.
     #[must_use]
     pub fn get(&self, prop: Prop) -> Option<u32> {
         self.props.get(prop.index()).and_then(|e| e.value)
     }
 
-    /// The values the camera currently accepts for a property, empty if it sent no list.
+    /// The values the camera accepts for a property, empty if it sent no list.
     #[must_use]
     pub fn allowed(&self, prop: Prop) -> &[u32] {
         self.props.get(prop.index()).map_or(&[], |e| &e.allowed)
     }
 
     /// Sets a property, refusing values outside the camera's allowed list.
-    ///
     /// # Errors
-    ///
-    /// Fails with [`Error::Unannounced`] or [`Error::NotAllowed`] before touching the camera,
-    /// or with what the camera answered.
+    /// When the property or value isn't allowed, or the camera refuses it.
     pub fn set(&mut self, prop: Prop, value: u32) -> Result<()> {
         if self.get(prop).is_none() {
             return Err(Error::Unannounced(prop));
@@ -712,21 +705,16 @@ impl Camera {
     }
 
     /// Runs one autofocus pass with the current AF method.
-    ///
     /// # Errors
-    ///
-    /// Fails with what the camera answered.
+    /// When the camera refuses.
     pub fn autofocus(&mut self) -> Result<()> {
         self.call_ok(OP_DO_AF, &[])?;
         self.drain()
     }
 
-    /// Moves focus by a step of -3..=3 in live view, negative being nearer. The lens switch has
-    /// to be on AF, since the body only drives the motor then.
-    ///
+    /// Moves focus by -3..=3, negative being nearer. The body only drives the motor on AF.
     /// # Errors
-    ///
-    /// Fails with [`Error::OutOfRange`] outside -3..=3, or with what the camera answered.
+    /// Outside -3..=3, or when the camera refuses.
     pub fn drive_lens(&mut self, step: i8) -> Result<()> {
         let param = match step {
             0 => return Ok(()),
@@ -738,26 +726,26 @@ impl Camera {
         self.drain()
     }
 
-    /// The raw battery level, see `values::battery_label`.
+    /// The raw battery level.
     #[must_use]
     pub fn battery(&self) -> Option<u32> {
         self.get(Prop::Battery)
     }
 
-    /// The exposure mode from the mode dial, see `values::ae_mode_label`.
+    /// The exposure mode.
     #[must_use]
     pub fn mode(&self) -> Option<u32> {
         self.get(Prop::AeModeDial)
             .or_else(|| self.get(Prop::AeMode))
     }
 
-    /// Properties the camera reported that have no `Prop`, by code.
+    /// Properties with no `Prop`, by code.
     #[must_use]
     pub const fn unnamed(&self) -> &std::collections::BTreeMap<u16, u32> {
         &self.unnamed
     }
 
-    /// The camera's model name from its `DeviceInfo`.
+    /// The model name.
     #[must_use]
     pub fn model(&self) -> &str {
         &self.model
@@ -770,6 +758,13 @@ impl Drop for Camera {
     }
 }
 
+/// Keeps the first error, except that a disconnect always wins so callers stop trying.
+fn keep_first(first: &mut Result<()>, next: Result<()>) {
+    if next == Err(Error::Disconnected) || (first.is_ok() && next.is_err()) {
+        *first = next;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -777,11 +772,9 @@ mod tests {
 
     #[test]
     fn lighting_optimizer_turns_off_in_either_form() {
-        // The T3 sends the strength alone and was on strong.
         assert_eq!(alo_off_value(2, &[]), Some(3));
         assert_eq!(alo_off_value(2, &[0, 1, 2, 3]), Some(3));
         assert_eq!(alo_off_value(3, &[]), None);
-        // Newer bodies repeat it, with bit 16 keeping it on in M.
         assert_eq!(
             alo_off_value(0x1_0202, &[0x1_0000, 0x1_0303]),
             Some(0x1_0303)
@@ -822,5 +815,26 @@ mod tests {
             e.to_string(),
             "WPD failed operation 0x9116 with HRESULT 0x80004005"
         );
+    }
+
+    #[test]
+    fn keeps_the_first_error_but_a_disconnect_wins() {
+        let busy = Err(Error::Ptp {
+            op: 1,
+            code: 0x2019,
+        });
+        let mut first = Ok(());
+        keep_first(&mut first, Ok(()));
+        keep_first(&mut first, busy.clone());
+        keep_first(
+            &mut first,
+            Err(Error::Ptp {
+                op: 2,
+                code: 0x2002,
+            }),
+        );
+        assert_eq!(first, busy);
+        keep_first(&mut first, Err(Error::Disconnected));
+        assert_eq!(first, Err(Error::Disconnected));
     }
 }

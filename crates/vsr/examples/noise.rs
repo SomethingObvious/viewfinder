@@ -1,5 +1,5 @@
-//! Scores each denoise level on a synthetic frame with ISO-style grain and the T3's JPEG
-//! compression, against the same upscaler fed the clean frame. `noise [dll dir] [sigma]`.
+//! Scores each denoise level on a grainy JPEG frame against the same upscaler fed the clean one.
+//! Usage: `noise [dll dir] [sigma]`.
 
 use std::time::Instant;
 
@@ -67,8 +67,7 @@ fn main() -> Result<(), String> {
     Ok(())
 }
 
-/// A face-free stand-in for a webcam frame: soft gradients like a wall, fine stripes like
-/// fabric, and hard-edged text-like marks.
+/// Gradients like a wall, stripes like fabric and hard marks like text.
 #[expect(
     clippy::suboptimal_flops,
     reason = "mul_add changes rounding, and the scene must stay the same"
@@ -97,7 +96,7 @@ fn scene() -> Vec<u8> {
     rgb
 }
 
-/// Gaussian grain, stronger in the darks like a real sensor's, from a fixed-seed generator.
+/// Gaussian grain, stronger in the darks like a real sensor's.
 #[expect(
     clippy::suboptimal_flops,
     reason = "mul_add changes rounding, and the grain must stay the same"
@@ -130,7 +129,7 @@ fn jpeg(rgb: &[u8], quality: u8) -> Result<Vec<u8>, String> {
         .map_err(|e| e.to_string())
 }
 
-/// PSNR over the top half (gradients only) and the bottom half (texture and marks).
+/// The top half is gradients only.
 fn split_psnr(a: &[u8], b: &[u8]) -> (f64, f64) {
     let half = a.len().div_euclid(2);
     let psnr = |a: &[u8], b: &[u8]| {

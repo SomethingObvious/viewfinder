@@ -1,6 +1,4 @@
-//! Opens "Viewfinder" through Media Foundation the way a call app does, behind Frame
-//! Server, and reports frame rate and timing. It never keeps or shows a picture, only
-//! counts frames and checks whether they're the grey placeholder.
+//! Opens "Viewfinder" the way a call app does and reports frame rate and timing.
 //!
 //! `cargo run --release -p vcam --example consumer -- 1920 1080 15`
 
@@ -21,7 +19,6 @@ use windows_core::PWSTR;
 
 const STREAM: u32 = MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32;
 
-/// What the read loop saw.
 struct Stats {
     samples: u32,
     placeholder: u32,
@@ -53,8 +50,7 @@ fn main() -> windows_core::Result<()> {
     println!("opened {width}x{height} NV12 in {:?}", opened.elapsed());
     let stats = measure(&reader, (width * height) as usize, secs)?;
     report(stats);
-    // SAFETY: the source and reader came from Media Foundation above, and MFShutdown matches
-    // the MFStartup at the top.
+    // SAFETY: plain COM calls, and MFShutdown pairs with the MFStartup above.
     unsafe {
         source.Shutdown()?;
         drop(reader);
@@ -63,12 +59,10 @@ fn main() -> windows_core::Result<()> {
     Ok(())
 }
 
-/// Lists every video capture device and returns the one named Viewfinder.
 #[expect(unsafe_code, reason = "Media Foundation is a COM API")]
 fn find_viewfinder() -> windows_core::Result<IMFActivate> {
-    // SAFETY: every out pointer points at a live local, the device list is read only for the
-    // `count` entries Media Foundation reported, and each string and the list are freed once
-    // with CoTaskMemFree as the API requires.
+    // SAFETY: the out pointers are live locals, the list is read for its `count` entries, and
+    // each string and the list are freed once.
     unsafe {
         let mut attrs = None;
         MFCreateAttributes(&raw mut attrs, 1)?;
@@ -104,15 +98,13 @@ fn find_viewfinder() -> windows_core::Result<IMFActivate> {
     }
 }
 
-/// Activates the source and asks its reader for NV12 at the given size.
 #[expect(unsafe_code, reason = "Media Foundation is a COM API")]
 fn open(
     device: &IMFActivate,
     width: u32,
     height: u32,
 ) -> windows_core::Result<(IMFMediaSource, IMFSourceReader)> {
-    // SAFETY: plain COM calls on interfaces that Media Foundation handed back, with no raw
-    // pointers involved.
+    // SAFETY: plain COM calls with no raw pointers.
     unsafe {
         let source: IMFMediaSource = device.ActivateObject()?;
         let reader = MFCreateSourceReaderFromMediaSource(&source, None)?;
@@ -128,7 +120,6 @@ fn open(
     }
 }
 
-/// Reads samples for `secs` seconds, counting placeholders and distinct frames.
 #[expect(unsafe_code, reason = "Media Foundation is a COM API")]
 fn measure(reader: &IMFSourceReader, luma: usize, secs: u32) -> windows_core::Result<Stats> {
     let (mut samples, mut placeholder, mut distinct) = (0u32, 0u32, 0u32);
@@ -155,8 +146,7 @@ fn measure(reader: &IMFSourceReader, luma: usize, secs: u32) -> windows_core::Re
             gaps.push((ts - prev) as f64 / 1e4);
         }
         last_ts = Some(ts);
-        // SAFETY: the buffer stays locked while `y` is read, `y` covers no more than the `len`
-        // bytes Lock reported, and it is not used after Unlock.
+        // SAFETY: `y` covers at most the `len` locked bytes and is dropped before Unlock.
         unsafe {
             let buffer = sample.ConvertToContiguousBuffer()?;
             let (mut ptr, mut len) = (std::ptr::null_mut(), 0);

@@ -1,48 +1,37 @@
-//! Steady exposure. With the mode dial on M the app sets ISO and shutter itself and only
-//! meters again once the light has really changed, like a lamp being switched on. A face moving
-//! nearer or farther moves the frame's level by well under a stop, so it changes nothing.
+//! Steady exposure on M: the app sets ISO and shutter and only meters again once the light
+//! really changes. A face moving nearer or farther moves the level by well under a stop.
 
 use std::sync::LazyLock;
 
-/// What the frame's level is steered to, as the log average of linear luminance. Mid grey in
-/// sRGB is about -2.5.
+/// The log average of linear luminance. Mid grey in sRGB is about -2.5.
 pub(crate) const TARGET: f32 = -2.5;
-/// How far the light has to move, in stops, before the exposure is metered again.
 const THRESHOLD: f32 = 1.0;
-/// How long it has to stay moved, in seconds, so someone walking past a window doesn't count.
+/// So someone walking past a window doesn't count.
 const HOLD: f64 = 1.5;
-/// How long after a change the camera's frames are trusted to show it.
 const SETTLE: f64 = 0.6;
-/// How long the level is averaged before metering decides.
 const MEASURE: f64 = 0.3;
-/// Seconds.
 const TAU: f64 = 0.25;
-/// Close enough to the target to stop adjusting. ISO comes in whole stops on the T3, so the
-/// finest steps it can make with the flicker-free shutters are about a third of a stop.
+/// ISO comes in whole stops on the T3, so the finest steps it can make with the flicker-free
+/// shutters are about a third of a stop.
 const TOLERANCE: f32 = 0.4;
-/// The most one adjustment moves, so a covered lens doesn't throw the settings to the limit.
 const MAX_STEP: f32 = 3.0;
 const MAX_TRIES: u32 = 4;
-/// If the picture moved by less than this share of an adjustment, the camera isn't showing
-/// the exposure in live view (or the lens is capped), so metering gives up and holds.
+/// A picture that moved less than this share of an adjustment means live view isn't showing
+/// the exposure, or the lens is capped.
 const RESPONSE: f32 = 0.3;
-/// Below this the frame is treated as black, so a capped lens reads as very dark, not as minus infinity.
 const FLOOR: f32 = -12.0;
 
 const ISO_100: u32 = 0x48;
 /// ISO 3200. Above it the T3's live view turns to mush, and 6400 is an expansion setting.
 const ISO_MAX: u32 = 0x70;
 const SHUTTER_30: u32 = 0x60;
-/// Multiples of 1/120 s, so lights on 60 Hz mains don't roll bands through the picture.
-/// 1/125 is the camera's nearest to 1/120.
+/// Multiples of 1/120 s (1/125 on the camera), so 60 Hz lights don't roll bands through.
 const FLICKER_FREE: [u32; 4] = [0x60, 0x63, 0x68, 0x70];
 
-/// Log2 of linear luminance for each 8-bit code, assuming a 2.2 gamma.
 pub(crate) static LINEAR: LazyLock<[f32; 256]> =
     LazyLock::new(|| std::array::from_fn(|c| (c as f32 / 255.0).powf(2.2).log2().max(FLOOR)));
 
-/// The log average of linear luminance over a decoded frame, sampling every 8th pixel of every
-/// 8th row. `pixels` is three bytes a pixel, either RGB or YCbCr with luma first.
+/// Samples every 8th pixel of every 8th row. `pixels` is RGB, or YCbCr with luma first.
 pub(crate) fn brightness(pixels: &[u8], width: usize, rgb: bool) -> f32 {
     if width == 0 {
         return FLOOR;
@@ -76,7 +65,7 @@ fn stops(code_from_base: i32) -> f32 {
     code_from_base.div_euclid(8) as f32 + frac
 }
 
-/// How much light ISO and shutter let through, in stops above ISO 100 at 1/30. None for Auto ISO.
+/// In stops above ISO 100 at 1/30. None for Auto ISO.
 fn exposure(iso: u32, shutter: u32) -> Option<f32> {
     (iso >= ISO_100).then(|| {
         stops(iso.cast_signed() - ISO_100.cast_signed())
@@ -97,7 +86,6 @@ pub(crate) struct Change {
     pub shutter: u32,
 }
 
-/// The allowed pair closest to `want` stops, preferring low ISO, then flicker-free shutters.
 #[expect(
     clippy::suboptimal_flops,
     reason = "mul_add would change rounding and is a software call without FMA"
@@ -133,27 +121,16 @@ fn pick(want: f32, s: &Settings<'_>) -> Option<Change> {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Phase {
-    /// Readings before `from` are ignored, then averaged for `MEASURE` before deciding.
-    Measure {
-        from: f64,
-        tries: u32,
-    },
-    Hold {
-        reference: f32,
-        away: Option<f64>,
-    },
+    Measure { from: f64, tries: u32 },
+    Hold { reference: f32, away: Option<f64> },
 }
 
-/// Decides when to change ISO and shutter from a stream of frame levels. Time is in seconds
-/// from any fixed start, so recorded or synthetic traces can be replayed through it.
 #[derive(Debug)]
 pub(crate) struct Steady {
     phase: Phase,
     level: Option<f32>,
     last: f64,
-    /// When the current measurement's first reading came in.
     first: f64,
-    /// The level before the last change and how many stops it was meant to move.
     applied: Option<(f32, f32)>,
 }
 
@@ -173,7 +150,6 @@ impl Default for Steady {
 }
 
 impl Steady {
-    /// Meters again from scratch, as after connecting or changing the target.
     pub(crate) fn remeter(&mut self, t: f64) {
         *self = Self {
             phase: Phase::Measure {
@@ -184,7 +160,6 @@ impl Steady {
         };
     }
 
-    /// Takes one frame's level at time `t` and says what to change.
     pub(crate) fn update(
         &mut self,
         t: f64,
@@ -290,8 +265,6 @@ impl Steady {
     }
 }
 
-/// What the app holds on the camera: steady exposure and the brightness it aims for in stops
-/// from `TARGET`, steady white balance, and how it focuses.
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[expect(
     clippy::struct_excessive_bools,
@@ -299,21 +272,16 @@ impl Steady {
 )]
 pub(crate) struct Prefs {
     pub steady: bool,
+    /// In stops from `TARGET`.
     pub brightness: f32,
     /// Off by default, as it's untested on the T3, which has no Kelvin setting in its menus.
     pub white: bool,
-    /// Autofocus runs the camera's own live view AF rather than the computer's.
     pub camera_af: bool,
-    /// Off by default, since it moves the lens on its own.
     pub hold_focus: bool,
-    /// Whether the app ever focuses by itself. The nudge buttons and Remember Focus work
-    /// either way.
     pub autofocus: bool,
-    /// Puts the lens back where it was last focused each time the camera comes on, since
-    /// the half-press that wakes the T3 also refocuses it.
+    /// The half-press that wakes the T3 also refocuses it.
     pub remember_focus: bool,
-    /// How much warmer than neutral white balance leaves the picture, in the natural log of
-    /// red over blue.
+    /// In the natural log of red over blue.
     pub warmth: f32,
 }
 
@@ -332,7 +300,6 @@ impl Default for Prefs {
     }
 }
 
-/// The most the Warmth slider moves white balance either way, about 30 mireds.
 pub(crate) const WARMTH: f32 = 0.3;
 
 pub(crate) fn load() -> Prefs {
@@ -379,18 +346,15 @@ mod tests {
     const SHUTTERS: [u32; 12] = [
         0x58, 0x5b, 0x5d, 0x60, 0x63, 0x65, 0x68, 0x6b, 0x6d, 0x70, 0x78, 0x80,
     ];
-    /// How long the camera takes to show a new setting in live view.
     const LAG: f64 = 0.15;
 
     struct Run {
         changes: Vec<(f64, Change)>,
-        /// Frame level minus target at the end.
         error: f32,
-        /// Exposure in stops at the end.
         exposure: f32,
     }
 
-    /// Plays `scene` (stops of light at ISO 100, 1/30) through a simulated camera at 28 fps.
+    /// `scene` is stops of light at ISO 100 and 1/30, played at 28 fps.
     fn run(secs: f64, start: Change, scene: impl Fn(f64) -> f32, responds: bool) -> Run {
         let mut steady = Steady::default();
         steady.remeter(0.0);
@@ -437,11 +401,10 @@ mod tests {
         shutter: 0x68,
     };
 
-    /// A dim room, about 3 stops under at ISO 100 and 1/30.
     const ROOM: f32 = -5.5;
 
-    /// Someone leaning in for ten seconds at a time and sitting back, swaying as they talk.
-    /// Up close their face hides more of a brighter wall, which takes the whole frame down 0.8 stops.
+    /// Leaning in for ten seconds at a time, swaying. Up close the face hides more of a brighter
+    /// wall, which takes the whole frame down 0.8 stops.
     #[expect(
         clippy::suboptimal_flops,
         reason = "the test scene reads as the formula it models"

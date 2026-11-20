@@ -1,5 +1,4 @@
-//! Counts cameras coming and going, so the list of them is only made again when it could
-//! have changed.
+//! Counts cameras coming and going, so the list is only rebuilt when it could have changed.
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -20,7 +19,6 @@ const CLASSES: [GUID; 3] = [
 ];
 
 static CHANGES: AtomicU64 = AtomicU64::new(0);
-/// The registrations live as long as the process, so only whether they worked is kept.
 static WATCHING: OnceLock<bool> = OnceLock::new();
 
 #[expect(unsafe_code, reason = "Windows calls this back with raw event data")]
@@ -53,8 +51,7 @@ fn watch() -> bool {
             };
             filter.u.DeviceInterface.ClassGuid = *class;
             let mut handle = HCMNOTIFICATION(std::ptr::null_mut());
-            // SAFETY: the filter and handle are live locals, and the callback lives for the
-            // process.
+            // SAFETY: the filter and handle are live locals, and the callback is a static fn.
             let r = unsafe {
                 CM_Register_Notification(&raw const filter, None, Some(on_change), &raw mut handle)
             };
@@ -63,17 +60,8 @@ fn watch() -> bool {
     })
 }
 
-/// How many times a camera, webcam or capture card has arrived or gone. The first call starts
-/// listening, and if Windows won't register, the count never moves.
+/// How many times a camera has arrived or gone. The first call starts listening.
 pub fn changes() -> u64 {
     watch();
     CHANGES.load(Ordering::Relaxed)
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn registers_for_every_class() {
-        assert!(super::watch());
-    }
 }

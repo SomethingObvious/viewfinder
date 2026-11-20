@@ -1,7 +1,5 @@
-//! The camera thread and the pipeline thread, and what they share with the window.
-//!
-//! Live view only runs while an app or the window is watching, which keeps the mirror down,
-//! the sensor cool and the battery full the rest of the time.
+//! The camera and pipeline threads. Live view only runs while an app or the window watches,
+//! which keeps the mirror down, the sensor cool and the battery full the rest of the time.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -20,42 +18,30 @@ use crate::pipeline::{GPU, Look, OUTPUT, Pipeline, crop_size, preview_output};
 use crate::{autoframe, general, white};
 use windows::Win32::Media::MediaFoundation::MFGetSystemTime;
 
-/// Live view stays up this long after the last watcher leaves, so switching apps doesn't flap
-/// the mirror.
+/// So switching apps doesn't flap the mirror.
 const LINGER: Duration = Duration::from_secs(10);
-/// The DLL counts as gone once it hasn't asked for a frame in this long.
 const CONSUMER_IDLE_MS: u64 = 2000;
 /// gphoto waits up to 3 s for the mirror and a focus pass, so a live view that has sent nothing
 /// for longer has stopped. On the T3 that usually means the sensor got warm.
 const STALL: Duration = Duration::from_secs(6);
-/// How long a camera can sit on one request before the log says so.
 const NO_ANSWER: Duration = Duration::from_secs(3);
-/// How long the camera is left alone after a stall.
 const REST: Duration = Duration::from_secs(60);
-/// How long errors go on before the camera is closed for `ERROR_REST`. Just after power on the
-/// T3 can answer busy for a second or two while it cleans its sensor.
+/// Just after power on the T3 can answer busy for a second or two while it cleans its sensor.
 const FAILING: Duration = Duration::from_secs(10);
 const ERROR_REST: Duration = Duration::from_secs(20);
-/// How often to look for an absent camera when arrivals can't be heard, and as a backstop.
 const ABSENT_CHECK: Duration = Duration::from_secs(10);
-/// How soon to try again when the camera is there but wouldn't open.
 const REOPEN: Duration = Duration::from_secs(2);
 const ARRIVAL_SETTLE: Duration = Duration::from_millis(500);
-/// How much of the way to a new white balance correction each frame goes, about a second at
-/// 30 fps.
 const EASE: f32 = 0.04;
-/// How much cooler than skin's target the picture sits with Warmth in the middle, which is
-/// where it looked right live.
+/// How much cooler than skin's target the middle of Warmth sits, where it looked right live.
 const COOLER: f32 = 0.05;
 const SAVE_SHOWN: Duration = Duration::from_secs(10);
-/// How long Auto waits for a face before going by the room alone. The detector looks twice a
-/// second and takes a moment to start.
+/// The face finder looks twice a second and takes a moment to start.
 const FACE_WAIT: Duration = Duration::from_millis(1500);
-/// How long errors go on before the window says so.
 const SHOW_AFTER: Duration = Duration::from_secs(2);
 const ASLEEP: &str = "Can't find the camera. Turn it on, or half-press the shutter if it's asleep.";
+pub(crate) const REFUSED: &str = "The camera is there but won't connect. Trying again.";
 
-/// A camera error as the window says it. The log keeps the codes.
 fn plain(e: &canon::Error) -> String {
     match e {
         canon::Error::NotFound | canon::Error::Disconnected => ASLEEP,
@@ -74,11 +60,8 @@ fn plain(e: &canon::Error) -> String {
     }
     .to_owned()
 }
-/// The mode dial's M, the one mode where the app can hold the exposure.
 const MODE_M: u32 = 3;
-/// The lens switch on MF, where the body won't drive the lens.
 const FOCUS_MF: u32 = 3;
-/// What the window renders when no app has asked for a format.
 const PREVIEW: Format = Format {
     width: 1280,
     height: 720,
@@ -93,7 +76,6 @@ pub(crate) enum Command {
     Set(Prop, u32),
     Autofocus,
     Focus(i8),
-    /// Ends a cool-down early, or resumes live view after the window alone paused it.
     Retry,
 }
 
@@ -119,31 +101,21 @@ pub(crate) struct Status {
     pub mode: Option<u32>,
     pub settings: Vec<Setting>,
     pub vcam: Option<String>,
-    /// Whether NVIDIA's super resolution libraries were found.
     pub vsr_available: bool,
     pub vsr_problem: Option<String>,
-    /// Cooling down after a stall, so Retry means something.
     pub resting: bool,
-    /// Live view stopped because only the window was watching, so Retry resumes it.
     pub paused: bool,
-    /// Decode plus render time per frame, averaged.
     pub frame_ms: f32,
-    /// The same split by stage: decode, pixel repair, the GPU and output.
+    /// Decode, pixel repair, the GPU and output.
     pub stage_ms: [f32; 4],
     pub stuck: usize,
     pub smoothing: bool,
-    /// The lens's AF/MF state as the body reports it, 3 being MF.
     pub focus_mode: Option<u32>,
-    /// How far the frame's level is from steady exposure's target, in stops.
     pub off_target: Option<f32>,
     pub focus: focus::Report,
-    /// The colour temperature steady white balance holds the camera at, in Kelvin.
     pub white_held: Option<u32>,
-    /// The colour of the light as the grey pixels say, in Kelvin.
     pub light: Option<u32>,
-    /// Steady white balance changed the camera and live view didn't show it.
     pub white_unseen: bool,
-    pub smooth_problem: Option<String>,
     pub hidden: bool,
 }
 
@@ -190,14 +162,12 @@ pub(crate) fn log(line: &str) {
     }
 }
 
-/// The newest preview frame, RGBA.
 #[derive(Default)]
 pub(crate) struct Preview {
     pub width: usize,
     pub height: usize,
     pub rgba: Vec<u8>,
     pub fresh: bool,
-    /// Luma in 64 bins, from the same frame.
     pub histogram: Vec<u32>,
     /// The camera's own picture for Compare, kept apart so the processed picture never skips.
     pub still: Vec<u8>,
@@ -205,14 +175,12 @@ pub(crate) struct Preview {
     pub still_fresh: bool,
 }
 
-/// What the pipeline reads off each decoded frame for the camera thread.
 #[derive(Clone, Copy, Debug, Default)]
 struct Measure {
-    /// The frame's number among those pulled, so the camera thread can tell which came after
-    /// it moved the lens. 0 before the first.
     frame: u64,
     level: f32,
     sharpness: Option<f32>,
+    face_width: Option<f32>,
     cast: Option<white::Cast>,
 }
 
@@ -223,31 +191,25 @@ pub(crate) struct Hub {
     pub(crate) look: Mutex<Look>,
     pub(crate) preview: Mutex<Preview>,
     pub(crate) preview_wanted: AtomicBool,
-    /// Show the camera's picture before any processing.
     pub(crate) compare: AtomicBool,
-    /// Each costs about 0.2 ms a frame, so they're only measured while focusing or holding
-    /// white balance.
+    /// Each costs about 0.2 ms a frame.
     want_sharpness: AtomicBool,
     want_cast: AtomicBool,
-    /// Send one camera original into `Preview::still`.
     pub(crate) want_original: AtomicBool,
     pub(crate) exposure: Mutex<exposure::Prefs>,
     pub(crate) chosen: Mutex<capture::Choice>,
     pub(crate) general: Mutex<general::Prefs>,
     pub(crate) adjust: Mutex<crate::adjust::Adjust>,
-    /// Set the Adjust sliders from the next frame.
     pub(crate) want_auto: AtomicBool,
     /// Never saved, so each start shows the camera.
     hidden: AtomicBool,
     measure: Mutex<Measure>,
-    /// The colour cast steady white balance left the camera with, which the pipeline takes out.
     post_white: Mutex<Option<white::Cast>>,
     consumer_active: AtomicBool,
     paused: AtomicBool,
-    /// `released` follows once the camera thread has handed the camera back.
     quit: AtomicBool,
     released: AtomicBool,
-    /// The newest frame, whether it's new, its number among the frames pulled, and its format.
+    /// The newest frame, whether it's new, its number and its format.
     mailbox: Mutex<(Vec<u8>, bool, u64, capture::Format)>,
     mail: Condvar,
     repaint: Mutex<Option<Repaint>>,
@@ -314,7 +276,6 @@ impl Hub {
         }
     }
 
-    /// Hands a frame to the pipeline thread, taking its buffer and leaving the old one.
     fn post(&self, frame: &mut Vec<u8>, pulled: u64, format: capture::Format) {
         let mut mailbox = lock(&self.mailbox);
         std::mem::swap(&mut mailbox.0, frame);
@@ -336,8 +297,6 @@ impl Hub {
     }
 }
 
-/// A poisoned lock only means another thread panicked mid-update, and every value here is safe
-/// to keep using after that.
 pub(crate) fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
@@ -358,8 +317,7 @@ pub(crate) fn spawn(hub: Arc<Hub>, commands: Receiver<Command>) {
         .ok();
 }
 
-/// Counts a request for a frame, and logs the minute's frames, requests and battery. A camera
-/// that drains its battery or slows down before it locks up shows here first.
+/// A camera that drains its battery or slows down before it locks up shows here first.
 fn tally(asked: &mut (Instant, u32, u32, Duration), cam: &Camera) {
     asked.2 += 1;
     if asked.0.elapsed() >= Duration::from_secs(60) {
@@ -374,7 +332,7 @@ fn tally(asked: &mut (Instant, u32, u32, Duration), cam: &Camera) {
     }
 }
 
-/// Logs a request the camera sits on, which is the last thing it did before it locks up.
+/// A request the camera sits on is the last thing it does before it locks up.
 #[expect(
     clippy::disallowed_methods,
     reason = "a thread of its own that only checks once a second"
@@ -447,7 +405,6 @@ fn camera_loop(hub: &Hub, commands: &Receiver<Command>) {
     hub.released.store(true, Ordering::Relaxed);
 }
 
-/// Stops live view and gives the camera back before the app exits, or gives up after 3 s.
 /// Without it the T3 kept streaming with its sensor on, and with the lighting optimizer and
 /// white balance as live view set them.
 #[expect(
@@ -465,27 +422,21 @@ pub(crate) fn let_go(hub: &Hub) {
 struct CameraThread<'a> {
     hub: &'a Hub,
     commands: &'a Receiver<Command>,
-    /// Whether device arrivals can be heard.
     watching: bool,
-    /// The camera this thread opens, copied from `Hub::chosen`.
     chosen: capture::Choice,
     camera: Option<Camera>,
-    /// The chosen camera when it isn't a Canon.
     other: Option<Box<dyn capture::Source>>,
     jpeg: Vec<u8>,
     last_watched: Option<Instant>,
-    /// `canon::arrivals` when last logged.
     arrivals: u64,
-    /// Since when the window has been the only thing watching.
     window_alone: Option<Instant>,
     counted: (Instant, u32),
-    /// When the minute started, its frames, the requests for one and their time, for the log.
+    /// When the minute started, its frames, the requests for one and their time.
     asked: (Instant, u32, u32, Duration),
     last_frame: Instant,
     rest_until: Option<Instant>,
     failing_since: Option<Instant>,
     exposure: SteadyState,
-    /// Frames pulled since the thread started, which numbers them for `Measure`.
     pulled: u64,
     focus: FocusState,
     white: WhiteState,
@@ -496,12 +447,10 @@ struct SteadyState {
     steady: Steady,
     on: bool,
     brightness: f32,
-    /// The number of the last frame fed to `steady`.
     seen: u64,
 }
 
 impl CameraThread<'_> {
-    /// One pass of the loop: let the camera go, wait out a rest, open it, or pull a frame.
     fn step(&mut self) {
         if canon::arrivals() != self.arrivals {
             self.arrivals = canon::arrivals();
@@ -512,7 +461,6 @@ impl CameraThread<'_> {
         if self.hub.watched() {
             self.last_watched = Some(Instant::now());
         }
-        // Hiding stops live view at once rather than after the linger.
         let wanted = !self.hub.hidden() && self.last_watched.is_some_and(|t| t.elapsed() < LINGER);
         if !wanted {
             if self.hub.paused.load(Ordering::Relaxed) {
@@ -566,7 +514,6 @@ impl CameraThread<'_> {
         }
     }
 
-    /// Lets the open camera go when another has been chosen, so the next pass opens that one.
     fn follow_choice(&mut self) {
         let chosen = lock(&self.hub.chosen).clone();
         if chosen == self.chosen {
@@ -577,7 +524,6 @@ impl CameraThread<'_> {
         let closed = self.release();
         self.rest_until = None;
         self.failing_since = None;
-        // Focus and white balance start over on the next Canon, and measure nothing till then.
         self.focus = FocusState::default();
         self.white = WhiteState::default();
         self.hub.want_sharpness.store(false, Ordering::Relaxed);
@@ -591,8 +537,7 @@ impl CameraThread<'_> {
         });
     }
 
-    /// Pauses live view once the window alone has watched for as long as Pause After says, since
-    /// live view warms the T3 and runs its battery down.
+    /// Live view warms the T3 and runs its battery down.
     fn pause_if_alone(&mut self) {
         let alone = !self.hub.consumer_active.load(Ordering::Relaxed)
             && self.hub.preview_wanted.load(Ordering::Relaxed);
@@ -607,7 +552,6 @@ impl CameraThread<'_> {
         }
     }
 
-    /// Whether the camera is still left alone after a stall or errors.
     fn resting(&mut self) -> bool {
         if self.rest_until.is_some_and(|t| Instant::now() < t) {
             // Turning the camera off and on again is the usual cure, so that ends the rest too.
@@ -631,7 +575,6 @@ impl CameraThread<'_> {
     }
 
     fn open(&mut self) {
-        // Clears any arrival already flagged, since this try covers it.
         canon::arrived();
         let opened = match &self.chosen {
             capture::Choice::Ptp {
@@ -659,7 +602,6 @@ impl CameraThread<'_> {
         }
     }
 
-    /// Opens a chosen Nikon, Sony, webcam or capture card.
     fn open_other(&mut self) {
         match capture::open(&self.chosen) {
             Ok(other) => {
@@ -675,13 +617,8 @@ impl CameraThread<'_> {
         }
     }
 
-    /// Says the chosen camera can't be reached and waits for it, never trying another.
     fn unreachable(&self, why: &str, absent: bool) {
-        let said = if absent {
-            ASLEEP
-        } else {
-            "The camera is there but won't connect. Trying again."
-        };
+        let said = if absent { ASLEEP } else { REFUSED };
         if lock(&self.hub.status).problem.as_deref() != Some(said) {
             log(&format!("can't open the camera: {why}"));
         }
@@ -689,8 +626,6 @@ impl CameraThread<'_> {
             s.camera = None;
             s.problem = Some(said.to_owned());
         });
-        // A camera that's off comes back as a device arrival, so the slow check is only a
-        // backstop. One that's there but won't open gets another go soon.
         let wait = if absent && self.watching {
             ABSENT_CHECK
         } else {
@@ -740,11 +675,18 @@ impl CameraThread<'_> {
         };
         if !lock(&hub.status).live {
             cam.start_live_view()?;
-            if self.focus.lost(&lock(&hub.exposure), cam) {
+            let prefs = *lock(&hub.exposure);
+            if self.focus.lost(&prefs, cam) {
                 self.focus.restore(hub, cam, self.pulled)?;
+            } else if prefs.autofocus
+                && prefs.hold_focus
+                && !prefs.camera_af
+                && cam.get(Prop::FocusMode) != Some(FOCUS_MF)
+            {
+                // Live view starts again whenever an app opens the camera.
+                self.focus.start(hub, focus::NUDGE, self.pulled);
             }
             self.last_frame = Instant::now();
-            // What the body reports at the start, for when the picture's brightness wanders.
             log(&format!(
                 "live view: dial {:?}, mode {:?}, ISO {:?}, shutter {:?}, lighting optimizer {:?}, exposure simulation {:?}, auto power off {:?}",
                 cam.get(Prop::AeModeDial),
@@ -803,7 +745,6 @@ impl CameraThread<'_> {
         Ok(())
     }
 
-    /// Streams a camera other than a Canon. Any error lets it go until the next pass.
     #[expect(
         clippy::disallowed_methods,
         reason = "runs on the camera thread, where waiting for the body is fine"
@@ -824,7 +765,10 @@ impl CameraThread<'_> {
             }
             Ok(None) => thread::sleep(Duration::from_millis(5)),
             Err(e) => {
-                self.other = None;
+                // Leaves the body out of live view and remote control, which a plain drop doesn't.
+                if let Some(src) = self.other.take() {
+                    src.close().ok();
+                }
                 hub.update(|s| {
                     s.camera = None;
                     s.live = false;
@@ -846,8 +790,6 @@ impl CameraThread<'_> {
         }
     }
 
-    /// Acts on how a pass went: a camera that's gone is dropped, one that stalled or keeps
-    /// failing gets a rest, and any other error is shown.
     #[expect(
         clippy::disallowed_methods,
         reason = "runs on the camera thread, where waiting for the body is fine"
@@ -901,7 +843,6 @@ impl CameraThread<'_> {
         }
 
         if let Err(e) = result {
-            // A moment's trouble, like the T3 being busy just after it wakes, isn't shown.
             if self
                 .failing_since
                 .is_some_and(|t| t.elapsed() >= SHOW_AFTER)
@@ -914,8 +855,6 @@ impl CameraThread<'_> {
 }
 
 impl SteadyState {
-    /// Feeds the newest frame level to steady exposure while the dial is on M, setting ISO and
-    /// shutter when it asks. Returns the frame's number, its level and the preferences used.
     #[expect(
         clippy::float_cmp,
         reason = "any change to the brightness setting at all starts metering again"
@@ -965,28 +904,25 @@ impl SteadyState {
     }
 }
 
-/// The computer's focusing as the camera thread runs it: one search at a time, from the button
-/// or from Always Focus, and Always Focus watching in between.
 #[derive(Default)]
 struct FocusState {
     search: Option<Search>,
     watch: Watch,
     seen: u64,
-    /// Whether the lens switch was on MF last time.
     manual: bool,
-    /// Where the lens is, once that's known, and the camera arrival it was known since.
     lens: Option<(Lens, u64)>,
+    nudging: bool,
 }
 
 /// Where the lens is, in small steps nearer than its far end.
 type Lens = f32;
 
-/// Big steps toward the far end that reach it from anywhere.
 const SWEEP: u32 = 25;
-/// Each `DriveLens` size, how far it moves the T3's kit lens in small steps, and the wait after
-/// it, since a step sent while the lens is still moving can be lost. The distances come from
-/// where each size brought the same face into focus from the far end. The body never says when
-/// the lens hits an end, so a step past the far end is taken to go nowhere.
+/// The whole travel in small steps, since the sweep from the near end takes `SWEEP` big ones.
+const TRAVEL: Lens = SWEEP as f32 * 19.0;
+/// Each `DriveLens` size, how far it moves the T3's kit lens in small steps (measured by
+/// focusing the same face from the far end), and the wait after it, since a step sent while the
+/// lens still moves can be lost. The body never says when the lens hits an end.
 const SIZES: [(i8, f32, Duration); 3] = [
     (3, 19.0, Duration::from_millis(250)),
     (2, 2.1, Duration::from_millis(120)),
@@ -1000,16 +936,22 @@ fn lens_step(step: i8) -> Option<(f32, Duration)> {
         .map(|s| (s.1, s.2))
 }
 
-/// Moves `lens` by a step. Positive steps go farther.
+/// Positive steps go farther, and a step past the far end goes nowhere.
 fn record(lens: &mut Lens, step: i8) {
     if let Some((unit, _)) = lens_step(step) {
-        *lens = f32::from(step.signum()).mul_add(-unit, *lens).max(0.0);
+        *lens = f32::from(step.signum())
+            .mul_add(-unit, *lens)
+            .clamp(0.0, TRAVEL);
     }
 }
 
 /// The steps that take the lens from its far end to `at`, biggest first, as size and count.
 fn steps_to(at: Lens) -> [(i8, u32); 3] {
-    let mut left = at.max(0.0);
+    let mut left = if at.is_finite() {
+        at.clamp(0.0, TRAVEL)
+    } else {
+        0.0
+    };
     SIZES.map(|(size, unit, _)| {
         let n = if size == 1 {
             left.round()
@@ -1031,14 +973,14 @@ fn lens_path() -> Option<std::path::PathBuf> {
 fn load_lens() -> Option<Lens> {
     let text = std::fs::read_to_string(lens_path()?).ok()?;
     let mut words = text.split_whitespace();
-    let at = words.next()?.parse().ok()?;
-    words.next().is_none().then_some(at)
+    let at: Lens = words.next()?.parse().ok()?;
+    (words.next().is_none() && at.is_finite()).then(|| at.clamp(0.0, TRAVEL))
 }
 
 fn save_lens(lens: Option<Lens>) {
     let Some(path) = lens_path() else { return };
     match lens {
-        Some(at) => drop(std::fs::write(path, format!("{at:.1}\n"))),
+        Some(at) => drop(crate::store::write_at(&path, &format!("{at:.1}\n"))),
         None => drop(std::fs::remove_file(path)),
     }
 }
@@ -1052,8 +994,6 @@ impl FocusState {
         Ok(())
     }
 
-    /// Whether the lens should be put back: Remember Focus is on, the lens can be driven, and
-    /// the camera was turned on since its place was last known.
     fn lost(&self, prefs: &exposure::Prefs, cam: &Camera) -> bool {
         prefs.remember_focus
             && cam.get(Prop::FocusMode) != Some(FOCUS_MF)
@@ -1062,8 +1002,6 @@ impl FocusState {
                 .is_none_or(|(_, since)| since != canon::arrivals())
     }
 
-    /// Runs the lens to its far end and back to where it was last focused, or focuses from
-    /// there when nothing was saved.
     #[expect(
         clippy::disallowed_methods,
         reason = "runs on the camera thread, where waiting for the lens is fine"
@@ -1109,20 +1047,18 @@ impl FocusState {
         }
     }
 
-    /// Forgets where the lens is, after the camera's own autofocus moved it.
     fn forget(&mut self) {
         self.lens = None;
         save_lens(None);
     }
 
-    /// Starts a search that only trusts frames pulled after the first `pulled`.
     fn start(&mut self, hub: &Hub, kind: (&'static [i8], u32), pulled: u64) {
         self.search = Some(Search::new(kind).after(pulled));
+        self.nudging = kind == focus::NUDGE;
         hub.want_sharpness.store(true, Ordering::Relaxed);
         hub.update(|s| s.focus = focus::Report::Searching);
     }
 
-    /// Ends any search where the lens is, as when someone nudges it by hand.
     fn stop(&mut self, hub: &Hub, t: f64) {
         self.watch.rebase(t);
         if self.search.take().is_some() {
@@ -1130,8 +1066,6 @@ impl FocusState {
         }
     }
 
-    /// Feeds the newest sharpness to the search, or to Always Focus between searches, and drives
-    /// the lens when the search asks. Nothing moves with the lens switch on MF.
     fn update(
         &mut self,
         hub: &Hub,
@@ -1154,8 +1088,14 @@ impl FocusState {
         }
         self.seen = measure.frame;
         let Some(search) = self.search.as_mut() else {
-            if holding && self.watch.update(t, measure.sharpness) {
-                log("hold focus: sharpness fell and stayed down, so nudging the lens");
+            if holding
+                && self
+                    .watch
+                    .update(t, measure.sharpness.zip(measure.face_width))
+            {
+                log(
+                    "always focus: the face blurred or moved nearer or farther, so nudging the lens",
+                );
                 self.start(hub, focus::NUDGE, pulled);
             }
             return Ok(());
@@ -1171,12 +1111,16 @@ impl FocusState {
         if let Some(report) = done {
             log(&format!("focus: {report:?}"));
             self.end(report, t);
-            hub.update(|s| s.focus = report);
+            // Small steps can't see a face that's far out of focus, so the whole range is tried.
+            if report == focus::Report::Flat && self.nudging {
+                self.start(hub, focus::SEARCH, pulled);
+            } else {
+                hub.update(|s| s.focus = report);
+            }
         }
         Ok(())
     }
 
-    /// Ends the search, keeping the spot whenever it brought a face into focus.
     fn end(&mut self, report: focus::Report, t: f64) {
         if report == focus::Report::Focused {
             self.keep();
@@ -1191,15 +1135,11 @@ struct WhiteState {
     steady: white::Steady,
     on: bool,
     seen: u64,
-    /// When the window was last told the light's colour, in seconds.
     told: f64,
-    /// The cast handed to the pipeline to take out.
     left: Option<white::Cast>,
 }
 
 impl WhiteState {
-    /// Feeds the newest grey colour to steady white balance while it's on and the dial allows
-    /// it, setting white balance when it asks. Turning it off puts the camera's own back.
     fn update(
         &mut self,
         hub: &Hub,
@@ -1278,7 +1218,6 @@ impl WhiteState {
     }
 }
 
-/// The white balance Steady last held, which the next start opens on.
 fn last_white() -> Option<(u32, Option<u32>)> {
     let text = crate::store::read("white-setting.txt")?;
     let mut v = text.split_whitespace().map(|n| n.parse::<u32>().ok());
@@ -1293,8 +1232,6 @@ fn save_white(wb: u32, kelvin: Option<u32>) {
     );
 }
 
-/// Waits up to `wait` for a camera to arrive or for Retry, which also comes when another camera
-/// is chosen. Other commands are dropped since there's no camera to send them to.
 #[expect(
     clippy::disallowed_methods,
     reason = "runs on the camera thread, where waiting for the body is fine"
@@ -1316,7 +1253,6 @@ fn wait_for_camera(commands: &Receiver<Command>, wait: Duration) {
     }
 }
 
-/// Throws away commands that came in while live view was paused, saying whether one was Retry.
 fn resume_asked(commands: &Receiver<Command>, wait: Duration) -> bool {
     let mut resume = match commands.recv_timeout(wait) {
         Ok(cmd) => matches!(cmd, Command::Retry),
@@ -1372,7 +1308,7 @@ fn publish_settings(hub: &Hub, cam: &Camera) {
 }
 
 fn pipeline_loop(hub: &Hub) {
-    let vfx = vfx_dir();
+    let vfx = crate::setup::vfx_dir();
     hub.update(|s| s.vsr_available = vfx.is_some());
     let mut pipeline = PipelineThread {
         hub,
@@ -1425,20 +1361,16 @@ struct PipelineThread<'a> {
     trim_at: Option<Instant>,
     greys: white::Greys,
     faces: face::Finder,
-    /// Auto Frame's crop while it's on, and when it last moved.
     steer: Option<(Instant, autoframe::Steer)>,
     skin: white::Skin,
-    /// What the camera's own setting leaves, which the face is measured against.
     room: Option<white::Cast>,
     auto_asked: Option<Instant>,
-    /// The correction on screen, which eases toward what's measured rather than jumping.
     shown: Option<white::Cast>,
     shown_saved: Instant,
     card: Option<(Format, Vec<u8>)>,
 }
 
 impl PipelineThread<'_> {
-    /// One pass of the loop: wait for a camera frame or the next paced read, and serve it.
     fn step(&mut self) {
         self.open_shared();
         let wanted = self
@@ -1446,7 +1378,8 @@ impl PipelineThread<'_> {
             .as_ref()
             .and_then(|s| s.wanted(CONSUMER_IDLE_MS));
         let active = wanted.is_some();
-        if self.hub.consumer_active.swap(active, Ordering::Relaxed) != active {
+        self.hub.consumer_active.store(active, Ordering::Relaxed);
+        if lock(&self.hub.status).consumer != wanted {
             self.hub.update(|s| s.consumer = wanted);
         }
         let look = self.auto_frame(*lock(&self.hub.look));
@@ -1465,8 +1398,7 @@ impl PipelineThread<'_> {
         }
 
         // Condvar waits wake on the 15.6 ms system tick, which made 4 in 10 frames miss the
-        // DLL's read, so the last stretch is slept on the standard library's high-resolution
-        // timer instead.
+        // DLL's read, so the last stretch is slept on the high-resolution timer instead.
         let until = if self.pacing {
             self.pacer
                 .until_tick(self.shared.as_ref(), self.out.frame_ms)
@@ -1491,8 +1423,6 @@ impl PipelineThread<'_> {
         }
     }
 
-    /// Moves the crop to follow the face while Auto Frame is on, leaving the saved pan and
-    /// framing alone.
     fn auto_frame(&mut self, mut look: Look) -> Look {
         if !look.auto_frame {
             self.steer = None;
@@ -1516,7 +1446,6 @@ impl PipelineThread<'_> {
         look
     }
 
-    /// Sends apps the hidden card and drops any frame still on its way.
     fn hide(&mut self, wanted: Option<Format>) {
         if self.pacing {
             self.pacing = false;
@@ -1562,8 +1491,6 @@ impl PipelineThread<'_> {
         };
     }
 
-    /// Builds the GPU passes again when something starts watching, lets them go after a quiet
-    /// spell, and trims memory after a build.
     fn manage_gpu(&mut self, wanted: Option<Format>, look: Look) {
         let watched = self.hub.watched();
         if watched {
@@ -1590,18 +1517,20 @@ impl PipelineThread<'_> {
         }
     }
 
-    /// Decodes the frame just taken from the mailbox and holds or emits it. False if broken.
+    /// False if the frame was broken.
     fn decode(&mut self, look: Look, wanted: Option<Format>, frame: u64) -> bool {
         let started = Instant::now();
+        self.pipeline.avoid_eyes(self.faces.face());
         if let Err(e) = self.pipeline.decode_frame(&self.jpeg, self.format, look) {
-            self.hub.update(|s| s.problem = Some(e));
+            self.out.raise(self.hub, DECODING, e);
             return false;
         }
+        self.out.settle(self.hub, DECODING);
         let (pixels, width, rgb) = self.pipeline.frame();
         let want_cast = self.hub.want_cast.load(Ordering::Relaxed);
         let want_sharpness = self.hub.want_sharpness.load(Ordering::Relaxed);
         // In mixed light the face is what has to look right, so its skin goes before the room.
-        if want_cast || want_sharpness || look.auto_frame {
+        if want_cast || want_sharpness || look.auto_frame || look.fix_pixels {
             self.faces.look(pixels, width, rgb);
         }
         let skin = if want_cast {
@@ -1611,15 +1540,12 @@ impl PipelineThread<'_> {
         } else {
             None
         };
+        let face = self.faces.face().filter(|_| want_sharpness);
         let measure = Measure {
             frame,
             level: exposure::brightness(pixels, width, rgb),
-            sharpness: focus::sharpness(
-                pixels,
-                width,
-                rgb,
-                self.faces.face().filter(|_| want_sharpness),
-            ),
+            sharpness: focus::sharpness(pixels, width, rgb, face),
+            face_width: face.map(|f| f.w as f32),
             // The room's greys alone, so a face moving around can't look like the light changing.
             cast: if want_cast {
                 self.greys.cast(pixels, width, rgb)
@@ -1634,12 +1560,12 @@ impl PipelineThread<'_> {
         let keep = self.hub.compare.load(Ordering::Relaxed)
             || self.hub.want_original.load(Ordering::Relaxed);
         self.pipeline.finish(balance, &adjust, keep);
-        // Sent as each camera frame is decoded, since paced output is mostly generated frames.
+        // Sent as each camera frame is decoded, since paced output repeats some.
         if self.hub.preview_wanted.load(Ordering::Relaxed)
             && (self.hub.compare.load(Ordering::Relaxed)
                 || self.hub.want_original.swap(false, Ordering::Relaxed))
         {
-            self.out.send_still(self.hub, &mut self.pipeline);
+            self.out.send_still(self.hub, &self.pipeline);
         }
         if self.pacing {
             self.pipeline.hold(self.seq);
@@ -1687,8 +1613,6 @@ impl PipelineThread<'_> {
         Some(cast)
     }
 
-    /// Sets the Adjust sliders from the frame just decoded once Auto is asked for, giving the
-    /// face finder a moment first so a face can be weighted.
     fn auto(&mut self, cast: Option<white::Cast>) {
         if self.hub.want_auto.swap(false, Ordering::Relaxed) {
             self.auto_asked = Some(Instant::now());
@@ -1722,7 +1646,6 @@ impl PipelineThread<'_> {
         self.hub.repaint();
     }
 
-    /// Sleeps the last stretch before the DLL's read and serves the paced frame for it.
     #[expect(
         clippy::disallowed_methods,
         reason = "the pipeline thread sleeps on the high-resolution timer to land before the read"
@@ -1741,20 +1664,11 @@ impl PipelineThread<'_> {
             );
             self.tally
                 .count(at, self.pacer.newest, self.pacer.missed(), started);
-            self.pacer.served();
-            let problem = self.pipeline.smooth_problem().map(str::to_owned);
-            if problem != self.out.smooth_problem {
-                self.out.smooth_problem.clone_from(&problem);
-                if let Some(p) = &problem {
-                    log(&format!("frame generation is off ({p})"));
-                }
-                self.hub.update(|s| s.smooth_problem = problem);
-            }
+            self.pacer.served = self.pacer.target;
         }
     }
 }
 
-/// Takes the newest frame if one arrives within `wait`, and says its number.
 fn take_mail(
     hub: &Hub,
     wait: Duration,
@@ -1775,18 +1689,16 @@ fn take_mail(
     got
 }
 
-/// How often the hidden card is sent again. The DLL counts a feed quiet for 250 ms as stopped.
+/// The DLL counts a feed quiet for 250 ms as stopped.
 const HIDDEN_EVERY: Duration = Duration::from_millis(100);
 
-/// How long nothing has watched before the GPU passes and big buffers are let go. They hold
-/// 460 MB of video memory and take 1.1 s to build again.
+/// The GPU passes hold 460 MB of video memory and take 1.1 s to build again.
 const RELEASE_AFTER: Duration = Duration::from_secs(60);
 
 /// Building the GPU passes touches about 210 MB that frames never touch again. Trimmed after the
 /// first frames, a call's working set settled at 52 MB rather than 268 at the same frame times.
 const TRIM_AFTER_BUILD: Duration = Duration::from_secs(3);
 
-/// Hands pages nothing is using back to Windows. Frames fault back what they need.
 #[expect(unsafe_code, reason = "trimming the working set is a Win32 call")]
 fn trim() {
     use windows::Win32::System::Threading::{GetCurrentProcess, SetProcessWorkingSetSize};
@@ -1794,7 +1706,6 @@ fn trim() {
     unsafe { SetProcessWorkingSetSize(GetCurrentProcess(), usize::MAX, usize::MAX).ok() };
 }
 
-/// Gets rendered frames to apps and the window.
 #[derive(Default)]
 struct Output {
     frame_no: u64,
@@ -1804,11 +1715,33 @@ struct Output {
     stage_ms: [f32; 4],
     still: Vec<u8>,
     published: Option<Instant>,
-    smooth_problem: Option<String>,
+    /// The problem a broken frame put up while decoding or rendering, taken down by the next
+    /// frame that gets through that same step.
+    raised: [Option<String>; 2],
 }
 
+const DECODING: usize = 0;
+const RENDERING: usize = 1;
+
 impl Output {
-    fn send_still(&mut self, hub: &Hub, pipeline: &mut Pipeline) {
+    fn raise(&mut self, hub: &Hub, step: usize, problem: String) {
+        if let Some(slot) = self.raised.get_mut(step) {
+            *slot = Some(problem.clone());
+        }
+        hub.update(|s| s.problem = Some(problem));
+    }
+
+    fn settle(&mut self, hub: &Hub, step: usize) {
+        if let Some(old) = self.raised.get_mut(step).and_then(Option::take) {
+            hub.update(|s| {
+                if s.problem.as_ref() == Some(&old) {
+                    s.problem = None;
+                }
+            });
+        }
+    }
+
+    fn send_still(&mut self, hub: &Hub, pipeline: &Pipeline) {
         let mut still = std::mem::take(&mut self.still);
         let size = pipeline.preview(&mut still);
         let mut p = lock(&hub.preview);
@@ -1823,7 +1756,6 @@ impl Output {
         reason = "mul_add would change rounding and is a software call without FMA"
     )]
     fn time_stages(&mut self, pipeline: &mut Pipeline, begun: Instant, gpu_before: f32) {
-        // Output is the rest of `emit`, with the GPU's share inside it taken out.
         pipeline.times[OUTPUT] +=
             (begun.elapsed().as_secs_f32() * 1000.0 - (pipeline.times[GPU] - gpu_before)).max(0.0);
         let times = std::mem::take(&mut pipeline.times);
@@ -1832,7 +1764,6 @@ impl Output {
         }
     }
 
-    /// Renders the current frame for the app reading the camera and the window, if either is.
     #[expect(
         clippy::suboptimal_flops,
         reason = "mul_add would change rounding and is a software call without FMA"
@@ -1849,6 +1780,7 @@ impl Output {
         let begun = Instant::now();
         let gpu_before = pipeline.times[GPU];
         let mut previewed = None;
+        let gpu_was_fine = pipeline.gpu_problem().is_none();
         if let (Some(s), Some(f)) = (shared, wanted) {
             self.frame_no += 1;
             let mut failed = None;
@@ -1865,20 +1797,25 @@ impl Output {
                     false
                 }
             });
-            if let Some(e) = failed {
-                let gpu = pipeline.gpu_problem().map(str::to_owned);
-                hub.update(|s| match gpu {
-                    Some(g) => s.vsr_problem = Some(g),
-                    None => s.problem = Some(e),
-                });
+            // A render that broke the GPU just now is the GPU's fault, reported below.
+            match failed {
+                Some(_) if gpu_was_fine && pipeline.gpu_problem().is_some() => {}
+                Some(e) => self.raise(hub, RENDERING, e),
+                None => self.settle(hub, RENDERING),
             }
+        } else {
+            // Nothing is going to apps, so a problem sending to them is over.
+            self.settle(hub, RENDERING);
         }
-        // With no app reading, the window still shows the processed picture calls will see.
         if preview && previewed.is_none() {
             self.local.resize(PREVIEW.bytes(), 0);
             if pipeline.render(PREVIEW, &mut self.local).is_ok() {
                 previewed = Some(preview_output(PREVIEW, &self.local, &mut self.rgba));
             }
+        }
+        // Either render can break the GPU, the preview's too when zoomed.
+        if gpu_was_fine && let Some(g) = pipeline.gpu_problem().map(str::to_owned) {
+            hub.update(|s| s.vsr_problem = Some(g));
         }
         if !preview {
             self.local = Vec::new();
@@ -1923,27 +1860,22 @@ impl Output {
 struct Pacer {
     arrivals: VecDeque<Instant>,
     newest: Option<u64>,
-    /// Position in frame numbers, 4.25 being a quarter of the way from frame 4 to 5.
+    /// In frame numbers, 4.25 being a quarter of the way from frame 4 to 5.
     at: f64,
-    /// `MFGetSystemTime` of the DLL read the next frame is for, and of the last one served.
     target: i64,
     served: i64,
-    /// How long before `target` to start, in the same units.
     lead: i64,
 }
 
 /// Frames the pacer stays behind the newest. In a replay of recorded arrival times, 2 behind
 /// repeated 1.5% of frames and 2.5 none, for about 60 and 70 ms of delay.
 const BUFFER: f64 = 2.2;
-/// How hard the pacer speeds up or slows down to hold `BUFFER`, as a fraction per frame of
-/// error. In a model of the T3's polling, 0.2 with the rate over 8 arrivals spaced the moments
-/// shown 3.8 to 4.4 ms apart in standard deviation, and 0.1 over 32 arrivals 1.6 to 1.7 ms,
-/// with the same delay and no repeats.
+/// In a model of the T3's polling, 0.2 with the rate over 8 arrivals spaced the moments shown
+/// 3.8 to 4.4 ms apart in standard deviation, and 0.1 over 32 arrivals 1.6 to 1.7 ms, with the
+/// same delay and no repeats.
 const GAIN: f64 = 0.1;
-/// Arrivals the camera's rate is measured over.
 const RATE_OVER: usize = 32;
 const INTERVAL_100NS: i64 = 333_333;
-/// How early to stop waiting on the mailbox, a tick of the system timer plus some slack.
 const COARSE_WAKE: Duration = Duration::from_millis(20);
 
 impl Pacer {
@@ -1959,8 +1891,6 @@ impl Pacer {
         }
     }
 
-    /// How long until work on the next frame should start, so it lands just before the DLL
-    /// reads. Falls back to its own 30 Hz clock when the DLL doesn't say.
     #[expect(unsafe_code, reason = "MFGetSystemTime is a Media Foundation call")]
     fn until_tick(&mut self, shared: Option<&Shared>, frame_ms: f32) -> Duration {
         // SAFETY: takes nothing.
@@ -1985,18 +1915,12 @@ impl Pacer {
         Duration::from_nanos((self.target - self.lead - now).max(0) as u64 * 100)
     }
 
-    /// Whether the DLL's read for this frame already passed, so it sent the one before again.
     #[expect(unsafe_code, reason = "MFGetSystemTime is a Media Foundation call")]
     fn missed(&self) -> bool {
         // SAFETY: takes nothing.
         unsafe { MFGetSystemTime() > self.target }
     }
 
-    const fn served(&mut self) {
-        self.served = self.target;
-    }
-
-    /// Moves on by one output frame and says where to draw.
     #[expect(
         clippy::suboptimal_flops,
         reason = "mul_add would change rounding and is a software call without FMA"
@@ -2016,16 +1940,14 @@ impl Pacer {
     }
 }
 
-/// Paced frames over the last minute, logged so a real call says why apps saw a frame twice.
 struct Tally {
     since: Instant,
     served: u32,
     /// Finished after the DLL's read, which then sent the previous frame again.
     late: u32,
-    /// Shown at the same moment as the frame before, the pacer having caught up with the camera.
+    /// Shown at the same moment as the frame before, having caught up with the camera.
     caught_up: u32,
     last_at: f64,
-    /// Render times in half-millisecond bins, the last one holding everything slower.
     render: [u32; 80],
 }
 
@@ -2067,7 +1989,6 @@ impl Tally {
         }
     }
 
-    /// The top of the half-millisecond bin that 99% of renders fit in.
     fn p99_ms(&self) -> f32 {
         let want = u64::from(self.served) * 99;
         let mut seen = 0u64;
@@ -2081,20 +2002,6 @@ impl Tally {
     }
 }
 
-/// NVIDIA's DLLs from `VIEWFINDER_VFX`, or `vfx` next to the exe where install.ps1 puts them.
-fn vfx_dir() -> Option<std::path::PathBuf> {
-    let dir = std::env::var_os("VIEWFINDER_VFX")
-        .map(std::path::PathBuf::from)
-        .or_else(|| {
-            std::env::current_exe()
-                .ok()?
-                .parent()
-                .map(|p| p.join("vfx"))
-        })?;
-    dir.join("NVVideoEffects.dll").is_file().then_some(dir)
-}
-
-/// Luma in 64 bins from every second RGBA pixel.
 fn histogram(rgba: &[u8]) -> Vec<u32> {
     let mut bins = vec![0u32; 64];
     for px in rgba.as_chunks::<4>().0.iter().step_by(2) {
@@ -2112,11 +2019,11 @@ mod bench;
 
 #[cfg(test)]
 mod tests {
-    use super::{FocusState, load_lens, record, save_lens, steps_to};
+    use std::time::Instant;
+
+    use super::{FocusState, Tally, load_lens, record, save_lens, steps_to};
     use crate::focus::{self, Search};
 
-    /// An Always Focus nudge that ends in focus saves the spot, and one that lost the face or
-    /// found nothing sharp leaves it.
     #[test]
     fn focusing_on_a_face_saves_the_spot() {
         let mut state = FocusState {
@@ -2157,5 +2064,25 @@ mod tests {
             }
         }
         assert!((lens - 73.4).abs() <= 0.5, "{lens}");
+    }
+
+    #[test]
+    fn tally_counts_repeats_by_cause_and_the_render_tail() {
+        let mut tally = Tally::new();
+        let started = Instant::now();
+        tally.count(2.0, Some(2), false, started);
+        tally.count(2.0, Some(2), false, started);
+        tally.count(2.9, Some(4), true, started);
+        tally.count(3.8, Some(4), false, started);
+        assert_eq!((tally.served, tally.late, tally.caught_up), (4, 1, 1));
+
+        let mut tally = Tally::new();
+        tally.served = 100;
+        tally.render[26] = 99;
+        tally.render[40] = 1;
+        assert!((tally.p99_ms() - 13.5).abs() < 1e-6);
+        tally.render[26] = 98;
+        tally.render[40] = 2;
+        assert!((tally.p99_ms() - 20.5).abs() < 1e-6);
     }
 }

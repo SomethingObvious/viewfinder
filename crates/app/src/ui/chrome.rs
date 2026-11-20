@@ -1,6 +1,5 @@
-//! The window's own title bar. Windows' frame is off, so the buttons are drawn here, and a
-//! hook tells Windows where the caption, edges and Maximize are, so it still moves, resizes and
-//! snaps the window, and opens Snap Layouts over Maximize.
+//! Windows' frame is off, so a hook tells it where the caption, edges and Maximize are,
+//! and it still moves, resizes and snaps the window and opens Snap Layouts.
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
@@ -23,27 +22,22 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use super::{DIM, INK, finish};
 
-/// How far down from the top of the window a press drags it.
 const CAPTION: f32 = super::switcher::BAR;
-/// How close to an edge a press resizes instead.
 const EDGE: f32 = 6.0;
 /// Windows 11's own caption buttons: their size, and Close's red.
 const KEY: Vec2 = Vec2::new(46.0, 32.0);
 const CLOSE_HOVER: Color32 = Color32::from_rgb(196, 43, 28);
-/// How much of the top bar the three buttons take.
 pub(super) const KEYS_WIDTH: f32 = KEY.x * 3.0;
 
-/// The window's procedure before the hook, which gets every message the hook leaves alone.
 static ORIGINAL: AtomicIsize = AtomicIsize::new(0);
-/// egui's points per physical pixel, as f32 bits, so the hook can work in points.
+/// Pixels per point as f32 bits, so the hook can work in points.
 static PPP: AtomicU32 = AtomicU32::new(0);
-/// Maximize belongs to Windows while the pointer is over it, so its hover and press come from
-/// the hook rather than from egui.
+/// Maximize belongs to Windows while the pointer is over it, so the hook tracks its hover
+/// and press.
 static MAX_HOT: AtomicBool = AtomicBool::new(false);
 static MAX_DOWN: AtomicBool = AtomicBool::new(false);
 static REPAINT: OnceLock<Context> = OnceLock::new();
 
-/// Hooks the window once, so Windows asks `hit` what each point is.
 #[expect(unsafe_code, reason = "replacing a window procedure is a Win32 call")]
 pub(super) fn install(hwnd: HWND, ctx: &Context) {
     if ORIGINAL.load(Ordering::Relaxed) != 0 {
@@ -91,6 +85,11 @@ unsafe extern "system" fn procedure(
             }
         }
         WM_NCMOUSEMOVE => {
+            // A press dragged off Maximize is cancelled. Without mouse capture a release
+            // elsewhere is never seen, so it can't be held for a return.
+            if !on_max {
+                MAX_DOWN.store(false, Ordering::Relaxed);
+            }
             if MAX_HOT.swap(on_max, Ordering::Relaxed) != on_max {
                 if on_max {
                     let mut track = TRACKMOUSEEVENT {
@@ -138,6 +137,7 @@ unsafe extern "system" fn procedure(
             repaint();
             return LRESULT(0);
         }
+        WM_NCLBUTTONUP if MAX_DOWN.swap(false, Ordering::Relaxed) => repaint(),
         _ => {}
     }
     // SAFETY: `original` is the procedure the window had, and gets the message unchanged.
@@ -150,8 +150,6 @@ fn repaint() {
     }
 }
 
-/// What a point in a window of `size` is, in points: an edge to resize by, the Maximize
-/// button, the caption to drag by, or the window's own.
 fn hit(pos: Pos2, size: Vec2, maximized: bool) -> u32 {
     if !maximized {
         let (left, right) = (pos.x < EDGE, pos.x > size.x - EDGE);
@@ -180,7 +178,6 @@ fn hit(pos: Pos2, size: Vec2, maximized: bool) -> u32 {
     }
 }
 
-/// Minimize, Maximize and Close, like Windows' own.
 pub(super) fn window_buttons(ui: &mut Ui, window: Rect) {
     let ctx = ui.ctx().clone();
     PPP.store(ctx.pixels_per_point().to_bits(), Ordering::Relaxed);

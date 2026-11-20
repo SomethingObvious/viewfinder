@@ -1,28 +1,21 @@
-//! What the Nikon and Sony backends share: a PTP transport to send operations through, the
-//! standard codes, the `DeviceInfo` dataset and finding the JPEG inside a live view reply.
+//! The PTP transport, codes and parsing the Nikon and Sony backends share.
 
-use crate::Result;
+use crate::{Error, Result};
 
-/// Sends PTP operations to one camera, through WPD or, in the tests, a script.
+/// Sends PTP operations to one camera.
 pub trait Transport {
-    /// An operation with no data phase. Returns the response code.
-    ///
+    /// An operation with no data phase, returning the response code.
     /// # Errors
-    ///
     /// Fails when the operation never reached the camera.
     fn call(&mut self, op: u16, params: &[u32]) -> Result<u16>;
 
-    /// An operation that reads data into `out`, replacing it. Returns the response code.
-    ///
+    /// An operation that replaces `out` with its data, returning the response code.
     /// # Errors
-    ///
     /// Fails when the operation never reached the camera.
     fn read(&mut self, op: u16, params: &[u32], out: &mut Vec<u8>) -> Result<u16>;
 
-    /// An operation that sends `data`. Returns the response code.
-    ///
+    /// An operation that sends `data`, returning the response code.
     /// # Errors
-    ///
     /// Fails when the operation never reached the camera.
     fn write(&mut self, op: u16, params: &[u32], data: &[u8]) -> Result<u16>;
 }
@@ -41,16 +34,22 @@ pub(crate) const RC_DEVICE_BUSY: u16 = 0x2019;
 /// The parts of a PTP `DeviceInfo` dataset the backends use.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct DeviceInfo {
-    /// `VendorExtensionID`: 0x0A is Nikon, 0x11 is Sony, 6 is Microsoft's MTP.
-    pub vendor: u32,
     /// Operations the camera advertises.
     pub ops: Vec<u16>,
     /// Device properties the camera advertises.
     pub props: Vec<u16>,
-    /// The manufacturer string.
-    pub manufacturer: String,
     /// The model string.
     pub model: String,
+}
+
+pub(crate) fn check(op: u16, code: u16) -> Result<()> {
+    if code == RC_OK {
+        Ok(())
+    } else {
+        Err(Error::Failed(format!(
+            "camera answered 0x{code:04X} to operation 0x{op:04X}"
+        )))
+    }
 }
 
 pub(crate) struct Reader<'a> {
@@ -101,9 +100,7 @@ impl Reader<'_> {
 #[must_use]
 pub fn parse_device_info(d: &[u8]) -> Option<DeviceInfo> {
     let mut r = Reader { d };
-    r.take(2)?;
-    let vendor = r.u32()?;
-    r.take(2)?;
+    r.take(8)?;
     r.string()?;
     r.take(2)?;
     let ops = r.u16_array()?;
@@ -111,20 +108,13 @@ pub fn parse_device_info(d: &[u8]) -> Option<DeviceInfo> {
     let props = r.u16_array()?;
     r.u16_array()?;
     r.u16_array()?;
-    let manufacturer = r.string()?;
+    r.string()?;
     let model = r.string()?;
-    Some(DeviceInfo {
-        vendor,
-        ops,
-        props,
-        manufacturer,
-        model,
-    })
+    Some(DeviceInfo { ops, props, model })
 }
 
-/// Where a JPEG that starts at `start` ends, by walking its marker segments, as
-/// `jpeg_segments_end` in library.c does. Table segments aren't byte-stuffed and can hold
-/// FF D9, so the first FF D9 isn't always the end.
+/// Where the JPEG at `start` ends, as gphoto's `jpeg_segments_end` finds it. Table segments
+/// aren't byte stuffed and can hold FF D9, so the first FF D9 isn't always the end.
 fn segments_end(d: &[u8], start: usize) -> Option<usize> {
     let at = |i: usize| d.get(i).copied();
     let mut p = start + 2;
@@ -165,8 +155,7 @@ fn segments_end(d: &[u8], start: usize) -> Option<usize> {
     None
 }
 
-/// Finds the JPEG inside a live view reply, as `save_jpeg_in_data_to_preview` in library.c
-/// does: from the first FF D8 to the end its segments give, or else to the next FF D9.
+/// The JPEG inside a live view reply, as gphoto's `save_jpeg_in_data_to_preview` finds it.
 #[must_use]
 pub fn find_jpeg(d: &[u8]) -> Option<&[u8]> {
     let start = d.windows(2).position(|w| w == [0xFF, 0xD8])?;
@@ -183,7 +172,6 @@ pub(crate) mod tests {
     use super::*;
     use std::collections::VecDeque;
 
-    /// One expected operation and what the camera answers.
     #[derive(Debug)]
     pub(crate) struct Step {
         pub op: u16,
@@ -215,7 +203,6 @@ pub(crate) mod tests {
         }
     }
 
-    /// A camera that expects exactly these operations in order.
     #[derive(Debug, Default)]
     pub(crate) struct Script(pub VecDeque<Step>);
 
@@ -309,10 +296,8 @@ pub(crate) mod tests {
         assert_eq!(
             info,
             DeviceInfo {
-                vendor: 0x0A,
                 ops: vec![0x9201, 0x9203],
                 props: vec![0xD1A2],
-                manufacturer: "Nikon Corporation".into(),
                 model: "D7000".into(),
             }
         );
@@ -342,7 +327,6 @@ pub(crate) mod tests {
 
     #[test]
     fn find_jpeg_falls_back_to_the_first_end_marker() {
-        // A JPEG that isn't well formed after its start, as a truncated table makes it.
         let d = [
             1, 2, 0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0xFF, 0x55, 0xFF, 0xD9, 7, 7,
         ];

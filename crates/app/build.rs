@@ -1,4 +1,4 @@
-//! Builds the icon into the exe, so Explorer, the taskbar and shortcuts show the mark.
+//! Embeds the icon in the exe.
 
 fn main() -> Result<(), embed_resource::CompilationResult> {
     println!("cargo::rerun-if-changed=assets/viewfinder.ico");

@@ -17,8 +17,5 @@ windows = { workspace = true, features = [
     "Win32_System_Registry",
 ] }
 
-[dev-dependencies]
-zune-jpeg = "0.5.15"
-
 [lints]
 workspace = true

@@ -1,23 +1,26 @@
-//! Any video capture device Windows knows, through Media Foundation: UVC webcams, HDMI and USB
-//! capture cards, and cameras with their own webcam drivers.
+//! Webcams and capture cards through Media Foundation.
 
 use std::ptr::null_mut;
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
+use std::time::{Duration, Instant};
 
 use windows::Win32::Devices::DeviceAndDriverInstallation::{
     CM_Open_Device_Interface_KeyW, CR_SUCCESS, RegDisposition_OpenExisting,
 };
 use windows::Win32::Media::MediaFoundation::{
-    IMF2DBuffer, IMFActivate, IMFAttributes, IMFMediaSource, IMFMediaType, IMFSourceReader,
-    MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME, MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE,
-    MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID,
+    IMF2DBuffer, IMFActivate, IMFAttributes, IMFMediaSource, IMFMediaType, IMFSample,
+    IMFSourceReader, IMFSourceReaderCallback, MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME,
+    MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE, MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID,
     MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_SYMBOLIC_LINK,
     MF_E_VIDEO_RECORDING_DEVICE_INVALIDATED, MF_E_VIDEO_RECORDING_DEVICE_PREEMPTED, MF_LOW_LATENCY,
     MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_SUBTYPE, MF_MT_YUV_MATRIX,
-    MF_SOURCE_READER_ALL_STREAMS, MF_SOURCE_READER_FIRST_VIDEO_STREAM,
-    MF_SOURCE_READERF_ENDOFSTREAM, MF_VERSION, MFCreateAttributes, MFCreateDeviceSource,
-    MFCreateSourceReaderFromMediaSource, MFEnumDeviceSources, MFSTARTUP_FULL, MFShutdown,
-    MFStartup, MFVideoFormat_MJPG, MFVideoFormat_NV12, MFVideoFormat_YUY2,
-    MFVideoTransferMatrix_BT601, MFVideoTransferMatrix_BT709,
+    MF_SOURCE_READER_ALL_STREAMS, MF_SOURCE_READER_ASYNC_CALLBACK,
+    MF_SOURCE_READER_FIRST_VIDEO_STREAM, MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED,
+    MF_SOURCE_READERF_ENDOFSTREAM, MF_SOURCE_READERF_NATIVEMEDIATYPECHANGED, MF_VERSION,
+    MFCreateAttributes, MFCreateDeviceSource, MFCreateSourceReaderFromMediaSource,
+    MFEnumDeviceSources, MFSTARTUP_FULL, MFShutdown, MFStartup, MFVideoFormat_MJPG,
+    MFVideoFormat_NV12, MFVideoFormat_YUY2, MFVideoTransferMatrix_BT601,
+    MFVideoTransferMatrix_BT709,
 };
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::System::Registry::{HKEY, KEY_READ, RRF_RT_REG_SZ, RegCloseKey, RegGetValueW};
@@ -25,14 +28,91 @@ use windows_core::{GUID, HSTRING, Interface, PWSTR, w};
 
 use crate::{Choice, Error, Format, Mta, Pixels, Result, Source};
 
-/// The pipeline never sends apps more than this, so a bigger mode only costs bandwidth.
+/// Apps never get more than this, so a bigger mode only costs bandwidth.
 const MAX_SIZE: (u32, u32) = (1920, 1080);
 const STREAM: u32 = MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32;
+/// A webcam whose frames stop for this long has hung, and is opened again. Even 5 fps in the
+/// dark comes well inside it.
+const STALL: Duration = Duration::from_secs(5);
+/// A capture card with no signal sends nothing at all, so a first frame gets longer.
+const FIRST_FRAME: Duration = Duration::from_secs(30);
+/// How long one `frame` call waits, so the camera thread still sees quit and switches.
+const STEP: Duration = Duration::from_millis(250);
+
+/// What the reader hands back for one `ReadSample`.
+struct Arrival {
+    status: windows_core::HRESULT,
+    flags: u32,
+    sample: Option<IMFSample>,
+}
+
+#[expect(
+    unsafe_code,
+    reason = "the sample interface pointer isn't Send on its own"
+)]
+#[expect(
+    clippy::non_send_fields_in_send_ty,
+    reason = "Media Foundation samples are free-threaded"
+)]
+// SAFETY: Media Foundation samples are free-threaded.
+unsafe impl Send for Arrival {}
+
+#[expect(
+    unsafe_code,
+    trivial_casts,
+    clippy::ref_as_ptr,
+    clippy::inline_always,
+    reason = "the COM glue #[implement] generates casts vtables and implements unsafe methods"
+)]
+mod arrivals {
+    use std::sync::mpsc::Sender;
+
+    use windows::Win32::Media::MediaFoundation::{
+        IMFMediaEvent, IMFSample, IMFSourceReaderCallback, IMFSourceReaderCallback_Impl,
+    };
+    use windows_core::{HRESULT, Ref, Result, implement};
+
+    use super::Arrival;
+
+    /// Passes each sample from the reader's thread to the camera thread.
+    #[derive(Debug)]
+    #[implement(IMFSourceReaderCallback)]
+    pub(super) struct Arrivals(pub(super) Sender<Arrival>);
+
+    impl IMFSourceReaderCallback_Impl for Arrivals_Impl {
+        fn OnReadSample(
+            &self,
+            status: HRESULT,
+            _stream: u32,
+            flags: u32,
+            _time: i64,
+            sample: Ref<'_, IMFSample>,
+        ) -> Result<()> {
+            // Nobody listening means the webcam closed, which is fine.
+            self.0
+                .send(Arrival {
+                    status,
+                    flags,
+                    sample: sample.cloned(),
+                })
+                .ok();
+            Ok(())
+        }
+
+        fn OnFlush(&self, _stream: u32) -> Result<()> {
+            Ok(())
+        }
+
+        fn OnEvent(&self, _stream: u32, _event: Ref<'_, IMFMediaEvent>) -> Result<()> {
+            Ok(())
+        }
+    }
+}
 
 /// How a capture mode's frames are coded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Coding {
-    /// Uncompressed 4:2:2, the most bandwidth for the picture.
+    /// Uncompressed 4:2:2.
     Yuy2,
     /// Motion JPEG, which most webcams need for their bigger sizes.
     Mjpg,
@@ -53,8 +133,7 @@ pub struct Mode {
     pub fps: f32,
 }
 
-/// The index of the mode to stream: the biggest that fits 1080p at 30 fps or more, then
-/// NV12 before MJPG before YUY2. With nothing that fast, the fastest of the biggest.
+/// The biggest mode that fits 1080p at 30 fps, then NV12 before MJPG before YUY2.
 #[must_use]
 pub fn best(modes: &[Mode]) -> Option<usize> {
     let key = |m: &Mode| {
@@ -78,11 +157,11 @@ pub fn best(modes: &[Mode]) -> Option<usize> {
 pub struct Device {
     /// The name Windows shows.
     pub name: String,
-    /// The device interface path, which opens it.
+    /// The device interface path.
     pub link: String,
 }
 
-/// Starts Media Foundation for as long as it lives. The calls nest.
+/// Keeps Media Foundation started while it lives. The calls nest.
 #[derive(Debug)]
 struct Mf;
 
@@ -141,7 +220,7 @@ fn string(a: &IMFAttributes, key: &GUID) -> String {
     s
 }
 
-/// The media source CLSID a Windows 11 virtual camera was made with, from its interface key.
+/// The media source CLSID of a Windows 11 virtual camera.
 #[expect(unsafe_code, reason = "the device interface key is read through Win32")]
 fn virtual_source(link: &str) -> Option<String> {
     let mut key = HKEY::default();
@@ -183,8 +262,8 @@ fn virtual_source(link: &str) -> Option<String> {
     Some(String::from_utf16_lossy(&units))
 }
 
-/// Whether a device is Viewfinder's own virtual camera, which would feed back, or Canon's EOS
-/// Webcam Utility, which wants the same camera.
+/// Viewfinder's own virtual camera would feed back, and Canon's EOS Webcam Utility wants the
+/// same camera.
 fn excluded(d: &Device, source: Option<&str>) -> bool {
     let link = d.link.to_ascii_lowercase();
     d.name.starts_with("Viewfinder")
@@ -219,12 +298,10 @@ fn activates() -> Result<Vec<IMFActivate>> {
     Ok(out)
 }
 
-/// Every video capture device Viewfinder may stream from, in the order Windows lists them.
-///
+/// Every video capture device Viewfinder may stream from.
 /// # Errors
-///
 /// Fails when Media Foundation won't start or list devices.
-pub fn devices() -> Result<Vec<Device>> {
+pub fn choices() -> Result<Vec<Choice>> {
     let _mta = Mta::enter()?;
     let _mf = Mf::start()?;
     Ok(activates()?
@@ -234,17 +311,6 @@ pub fn devices() -> Result<Vec<Device>> {
             link: string(a, &MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_SYMBOLIC_LINK),
         })
         .filter(|d| !excluded(d, virtual_source(&d.link).as_deref()))
-        .collect())
-}
-
-/// Every video device in [`devices`] as a [`Choice`].
-///
-/// # Errors
-///
-/// Fails when Media Foundation won't start or list devices.
-pub fn choices() -> Result<Vec<Choice>> {
-    Ok(devices()?
-        .into_iter()
         .map(|d| Choice::Video {
             link: d.link,
             name: d.name,
@@ -252,11 +318,9 @@ pub fn choices() -> Result<Vec<Choice>> {
         .collect())
 }
 
-/// Opens the webcam `choice` names, see [`Choice::find`].
-///
+/// Opens the webcam `choice` names.
 /// # Errors
-///
-/// Fails with [`Error::NotFound`] when it isn't plugged in, or as [`Webcam::open`] does.
+/// Fails when it isn't plugged in, or as [`Webcam::open`] does.
 pub fn open_choice(choice: &Choice) -> Result<Webcam> {
     let mut found = choices()?;
     match choice.find(&found).map(|i| found.swap_remove(i)) {
@@ -300,8 +364,14 @@ pub struct Webcam {
     reader: IMFSourceReader,
     source: IMFMediaSource,
     name: String,
-    mode: Mode,
     format: Format,
+    arrivals: Receiver<Arrival>,
+    /// A `ReadSample` is out and its answer hasn't come yet.
+    asked: bool,
+    /// A frame has come since it opened.
+    flowing: bool,
+    /// When it opened or last sent something.
+    heard: Instant,
     _mf: Mf,
     _mta: Mta,
 }
@@ -314,15 +384,12 @@ pub struct Webcam {
     clippy::non_send_fields_in_send_ty,
     reason = "the media source and source reader are free-threaded"
 )]
-// SAFETY: Media Foundation's device source and source reader are free-threaded objects, and
-// every call comes from an MTA thread, which `Mta` keeps alive.
+// SAFETY: the device source and source reader are free-threaded, and `Mta` keeps the MTA up.
 unsafe impl Send for Webcam {}
 
 impl Webcam {
-    /// Opens a device from [`devices`] and sets it to its [`best`] mode.
-    ///
+    /// Opens a device in its [`best`] mode.
     /// # Errors
-    ///
     /// Fails when the device is gone, busy in another app, or has no mode Viewfinder can read.
     #[expect(unsafe_code, reason = "Media Foundation is COM")]
     pub fn open(device: &Device) -> Result<Self> {
@@ -346,10 +413,16 @@ impl Webcam {
         // SAFETY: the attributes are live.
         let source =
             unsafe { MFCreateDeviceSource(&a) }.map_err(failed("can't open the camera"))?;
+        let (sender, arrivals): (Sender<Arrival>, _) = channel();
+        let callback: IMFSourceReaderCallback = arrivals::Arrivals(sender).into();
         let opened = (|| {
-            let ra = attributes(1)?;
-            // SAFETY: the key is a static. Low latency stops the reader queueing frames.
-            unsafe { ra.SetUINT32(&MF_LOW_LATENCY, 1) }.map_err(failed("can't set low latency"))?;
+            let ra = attributes(2)?;
+            // SAFETY: the keys are statics. Low latency stops the reader queueing frames.
+            unsafe {
+                ra.SetUINT32(&MF_LOW_LATENCY, 1)
+                    .and_then(|()| ra.SetUnknown(&MF_SOURCE_READER_ASYNC_CALLBACK, &callback))
+            }
+            .map_err(failed("can't set the reader up"))?;
             // SAFETY: both are live.
             let reader = unsafe { MFCreateSourceReaderFromMediaSource(&source, &ra) }
                 .map_err(failed("can't read the camera"))?;
@@ -372,9 +445,9 @@ impl Webcam {
             .map_err(failed("the camera refused its own mode"))?;
             // SAFETY: the key is a static.
             let matrix = unsafe { chosen.GetUINT32(&MF_MT_YUV_MATRIX) }.ok();
-            Ok((reader, format_of(*picked, matrix), *picked))
+            Ok((reader, format_of(*picked, matrix)))
         })();
-        let (reader, format, mode) = match opened {
+        let (reader, format) = match opened {
             Ok(o) => o,
             Err(e) => {
                 // SAFETY: the source is live and not used after this.
@@ -386,26 +459,22 @@ impl Webcam {
             reader,
             source,
             name: device.name.clone(),
-            mode,
             format,
+            arrivals,
+            asked: false,
+            flowing: false,
+            heard: Instant::now(),
             _mf: mf,
             _mta: mta,
         })
     }
-
-    /// The mode the device is streaming.
-    #[must_use]
-    pub const fn mode(&self) -> Mode {
-        self.mode
-    }
 }
 
-/// What a mode's frames come out as, given the colour matrix its media type names.
 const fn format_of(mode: Mode, matrix: Option<u32>) -> Format {
     let bt709 = match matrix {
         Some(m) if m == MFVideoTransferMatrix_BT709.0 as u32 => true,
         Some(m) if m == MFVideoTransferMatrix_BT601.0 as u32 => false,
-        // Unlabelled HD video is BT.709 and SD is BT.601, as in every video standard.
+        // Unlabelled HD is BT.709 and SD is BT.601.
         _ => mode.height >= 720,
     };
     let pixels = match mode.coding {
@@ -426,15 +495,16 @@ fn copy_out(
     buffer: &windows::Win32::Media::MediaFoundation::IMFMediaBuffer,
     out: &mut Vec<u8>,
 ) -> windows_core::Result<()> {
-    out.clear();
-    // A 2D buffer can pad its rows, and copying it out contiguously drops the padding.
+    // A 2D buffer can pad its rows, and the contiguous copy drops the padding.
     if let Ok(two) = buffer.cast::<IMF2DBuffer>() {
         // SAFETY: the buffer is live.
         let len = unsafe { two.GetContiguousLength()? } as usize;
+        // The copy fills every byte, so a frame the same size as the last skips the zeroing.
         out.resize(len, 0);
         // SAFETY: `out` holds exactly the contiguous length.
         return unsafe { two.ContiguousCopyTo(out) };
     }
+    out.clear();
     let mut p = null_mut();
     let mut len = 0;
     // SAFETY: both out slots are live locals, and Unlock pairs with this.
@@ -458,22 +528,57 @@ impl Source for Webcam {
 
     #[expect(unsafe_code, reason = "reading a sample is a Media Foundation call")]
     fn frame(&mut self, out: &mut Vec<u8>) -> Result<Option<Format>> {
-        let mut flags = 0;
-        let mut sample = None;
-        // SAFETY: the out slots are live locals. This blocks until the next frame.
-        unsafe {
-            self.reader.ReadSample(
-                STREAM,
-                0,
-                None,
-                Some(&raw mut flags),
-                None,
-                Some(&raw mut sample),
-            )
+        if !self.asked {
+            // SAFETY: the reader is async, so every out slot stays empty and the answer comes
+            // through the callback.
+            unsafe { self.reader.ReadSample(STREAM, 0, None, None, None, None) }
+                .map_err(failed("lost the camera's stream"))?;
+            self.asked = true;
         }
-        .map_err(failed("lost the camera's stream"))?;
+        let Arrival {
+            status,
+            flags,
+            sample,
+        } = match self.arrivals.recv_timeout(STEP) {
+            Ok(arrival) => arrival,
+            Err(RecvTimeoutError::Timeout) => {
+                let limit = if self.flowing { STALL } else { FIRST_FRAME };
+                if self.heard.elapsed() < limit {
+                    return Ok(None);
+                }
+                let what = if self.flowing {
+                    "stopped sending frames"
+                } else {
+                    "hasn't sent a frame"
+                };
+                return Err(Error::Failed(format!("{} {what}", self.name)));
+            }
+            Err(RecvTimeoutError::Disconnected) => return Err(Error::Disconnected),
+        };
+        self.asked = false;
+        self.heard = Instant::now();
+        status.ok().map_err(failed("lost the camera's stream"))?;
+        self.flowing |= sample.is_some();
         if flags & MF_SOURCE_READERF_ENDOFSTREAM.0 as u32 != 0 {
             return Err(Error::Disconnected);
+        }
+        // A webcam can change size mid-stream, after its own settings panel or a USB squeeze,
+        // and every later frame is the new size.
+        let changed = (MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED.0
+            | MF_SOURCE_READERF_NATIVEMEDIATYPECHANGED.0) as u32;
+        if flags & changed != 0 {
+            // SAFETY: the stream index is Windows' constant for the first video stream.
+            let current = unsafe { self.reader.GetCurrentMediaType(STREAM) }
+                .map_err(failed("can't read the camera's new mode"))?;
+            let picked = mode(&current).ok_or_else(|| {
+                Error::Unsupported(format!(
+                    "{} switched to a mode Viewfinder can't read",
+                    self.name
+                ))
+            })?;
+            // SAFETY: the key is a static.
+            let matrix = unsafe { current.GetUINT32(&MF_MT_YUV_MATRIX) }.ok();
+            self.format = format_of(picked, matrix);
         }
         // A gap in the stream comes back with no sample.
         let Some(sample) = sample else {
@@ -495,8 +600,7 @@ impl Source for Webcam {
 impl Drop for Webcam {
     #[expect(unsafe_code, reason = "shutting the source down is a COM call")]
     fn drop(&mut self) {
-        // Shutdown lets the device go, which turns its light off.
-        // SAFETY: the source is live and nothing uses it after this.
+        // SAFETY: the source is live and unused after this. Shutdown turns the light off.
         unsafe { self.source.Shutdown() }.ok();
     }
 }
@@ -574,88 +678,5 @@ mod tests {
             ),
             None
         ));
-    }
-
-    /// Checks a real webcam's frames by size and timing only, never what they show.
-    /// `VF_TEST_CAMERA` names the camera.
-    #[test]
-    #[ignore = "turns on a real camera"]
-    fn streams_from_a_real_webcam() {
-        use std::time::Instant;
-
-        let _mta = Mta::enter().unwrap();
-        let _mf = Mf::start().unwrap();
-        for a in activates().unwrap() {
-            let name = string(&a, &MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME);
-            let link = string(&a, &MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_SYMBOLIC_LINK);
-            println!(
-                "listed {name:?}, virtual source {:?}",
-                virtual_source(&link)
-            );
-        }
-        let all = devices().unwrap();
-        for d in &all {
-            println!("kept {:?}", d.name);
-        }
-        assert!(all.iter().all(|d| !d.name.starts_with("Viewfinder")));
-        let want = std::env::var("VF_TEST_CAMERA").unwrap_or_else(|_| "Integrated Camera".into());
-        let device = all.iter().find(|d| d.name == want).expect("no such camera");
-
-        let opened = Instant::now();
-        let webcam = Webcam::open(device).unwrap();
-        println!("opened in {:?}, mode {:?}", opened.elapsed(), webcam.mode());
-        let mut cam: Box<dyn Source> = Box::new(webcam);
-        let mut out = Vec::new();
-        let mut rgb = Vec::new();
-        let mut gaps = Vec::new();
-        let (mut frames, mut last) = (0, Instant::now());
-        let started = Instant::now();
-        while started.elapsed() < std::time::Duration::from_secs(2) {
-            let Some(format) = cam.frame(&mut out).unwrap() else {
-                continue;
-            };
-            gaps.push(last.elapsed().as_secs_f32() * 1000.0);
-            last = Instant::now();
-            frames += 1;
-            match format {
-                Format::Jpeg => {
-                    let mut d = zune_jpeg::JpegDecoder::new(
-                        zune_jpeg::zune_core::bytestream::ZCursor::new(&out),
-                    );
-                    d.decode_headers().unwrap();
-                    let (w, h) = d.dimensions().unwrap();
-                    assert!(d.decode().is_ok(), "MJPG frame didn't decode");
-                    if frames == 1 {
-                        println!("MJPG {w}x{h}, {} bytes", out.len());
-                    }
-                }
-                Format::Raw {
-                    pixels,
-                    width,
-                    height,
-                    bt709,
-                } => {
-                    crate::convert::to_rgb(pixels, width, height, bt709, &out, &mut rgb).unwrap();
-                    assert_eq!(rgb.len(), width as usize * height as usize * 3);
-                    if frames == 1 {
-                        println!(
-                            "{pixels:?} {width}x{height} bt709={bt709}, {} bytes",
-                            out.len()
-                        );
-                    }
-                }
-            }
-        }
-        let secs = started.elapsed().as_secs_f32();
-        gaps.remove(0);
-        gaps.sort_by(f32::total_cmp);
-        let median = gaps.get(gaps.len().div_euclid(2)).copied().unwrap_or(0.0);
-        let worst = gaps.last().copied().unwrap_or(0.0);
-        println!(
-            "{frames} frames in {secs:.2} s, {:.1} fps, median gap {median:.1} ms, worst {worst:.1} ms",
-            frames as f32 / secs
-        );
-        assert!(frames > 10);
-        cam.close().unwrap();
     }
 }

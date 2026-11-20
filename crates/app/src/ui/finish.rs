@@ -1,5 +1,5 @@
-//! Keepsake's material: a flat ground, 1 px outlines, square corners and spaced capitals.
-//! Each call is a handful of shapes, since the window repaints with every camera frame.
+//! Keepsake's material. Each call is a handful of shapes, since the window repaints with
+//! every camera frame.
 
 use std::sync::Arc;
 
@@ -26,7 +26,6 @@ pub(super) fn name_family() -> FontFamily {
     FontFamily::Name("name".into())
 }
 
-/// One physical pixel, in points.
 pub(super) fn hair(p: &Painter) -> f32 {
     1.0 / p.pixels_per_point()
 }
@@ -35,7 +34,6 @@ pub(super) fn outline(p: &Painter, rect: Rect, colour: Color32) {
     p.rect_stroke(rect, 0, Stroke::new(hair(p), colour), StrokeKind::Inside);
 }
 
-/// Keyboard focus: a 1 px Plot Ink outline standing 2 px off the control.
 pub(super) fn focus_ring(p: &Painter, rect: Rect) {
     p.rect_stroke(
         rect.expand(2.0),
@@ -45,8 +43,7 @@ pub(super) fn focus_ring(p: &Painter, rect: Rect) {
     );
 }
 
-/// A square of colour code, filled when its stage runs and hollow when it doesn't, so the
-/// two differ in shape as well as colour.
+/// Hollow when off, so on and off differ in shape as well as colour.
 pub(super) fn code(p: &Painter, rect: Rect, colour: Color32, filled: bool) {
     if filled {
         p.rect_filled(rect, 0, colour);
@@ -55,7 +52,6 @@ pub(super) fn code(p: &Painter, rect: Rect, colour: Color32, filled: bool) {
     }
 }
 
-/// A warning triangle with its centre at `centre`, 10 points across.
 pub(super) fn warning(p: &Painter, centre: Pos2, colour: Color32) {
     let (w, h) = (5.0, 4.5);
     p.add(Shape::convex_polygon(
@@ -69,11 +65,8 @@ pub(super) fn warning(p: &Painter, centre: Pos2, colour: Color32) {
     ));
 }
 
-/// How long a state takes to change, in seconds.
 const FADE: f32 = 0.12;
 
-/// How far `id` has turned on, from 0 to 1, over `FADE`. With Windows' animations off it
-/// switches at once.
 pub(super) fn lit(p: &Painter, id: Id, on: bool) -> f32 {
     let ctx = p.ctx();
     let fade = if ctx.global_style().animation_time > 0.0 {
@@ -84,7 +77,6 @@ pub(super) fn lit(p: &Painter, id: Id, on: bool) -> f32 {
     ctx.animate_bool_with_time(id.with("lit"), on, fade)
 }
 
-/// `text` in capitals in `family`, tracked out by `tracking` of its size.
 fn spaced(text: &str, family: FontFamily, size: f32, tracking: f32, colour: Color32) -> LayoutJob {
     let mut job = LayoutJob::default();
     let format = TextFormat {
@@ -97,17 +89,14 @@ fn spaced(text: &str, family: FontFamily, size: f32, tracking: f32, colour: Colo
     job
 }
 
-/// Label type: spaced capitals at 0.12em.
 pub(super) fn label_job(text: &str, size: f32, colour: Color32) -> LayoutJob {
     spaced(text, label_family(), size, 0.12, colour)
 }
 
-/// The app's name, in expanded capitals at 0.22em, as Keepsake sets its own.
 pub(super) fn name_job(text: &str, size: f32, colour: Color32) -> LayoutJob {
     spaced(text, name_family(), size, 0.22, colour)
 }
 
-/// Returns where the label went.
 pub(super) fn label(
     p: &Painter,
     pos: Pos2,
@@ -120,8 +109,6 @@ pub(super) fn label(
     place(p, pos, align, galley, colour)
 }
 
-/// Paints a galley anchored at `pos`. Letter spacing leaves a trailing gap after
-/// the last letter, so it is left out of the size used to anchor.
 pub(super) fn place(
     p: &Painter,
     pos: Pos2,
@@ -129,16 +116,8 @@ pub(super) fn place(
     galley: Arc<Galley>,
     colour: Color32,
 ) -> Rect {
-    let size = galley.size() - Vec2::new(trail(&galley), 0.0);
+    let size = galley.size();
     let rect = align.anchor_size(pos, size);
     p.galley(rect.min, galley, colour);
     rect
-}
-
-pub(super) fn trail(galley: &Galley) -> f32 {
-    galley
-        .job
-        .sections
-        .first()
-        .map_or(0.0, |s| s.format.extra_letter_spacing)
 }

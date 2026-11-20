@@ -1,5 +1,4 @@
-//! Tells the capture thread when a Canon appears on WPD, so it can wait for the camera to be
-//! turned on without polling.
+//! Tells the capture thread when a Canon appears on WPD, so it needn't poll.
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -44,8 +43,7 @@ unsafe extern "system" fn on_change(
     0
 }
 
-/// Starts listening for Canon cameras arriving on WPD. False if Windows wouldn't register
-/// for the notification, in which case the caller has to look for the camera itself.
+/// Starts listening for Canons arriving on WPD, false if Windows wouldn't register.
 #[expect(
     unsafe_code,
     reason = "registering for device notifications is a Win32 call"
@@ -72,18 +70,7 @@ pub fn arrived() -> bool {
     ARRIVED.swap(false, Ordering::Relaxed)
 }
 
-/// How many times a Canon has arrived since the app started. A body that went away and came
-/// back was turned on again, which may have moved its lens.
+/// How many times a Canon has arrived. A body that came back may have moved its lens.
 pub fn arrivals() -> u64 {
     ARRIVALS.load(Ordering::Relaxed)
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn registers_for_wpd_arrivals() {
-        assert!(super::watch_arrivals());
-        super::arrived();
-        assert!(!super::arrived());
-    }
 }

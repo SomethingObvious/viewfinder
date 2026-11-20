@@ -1,5 +1,4 @@
-//! Turns a raw NV12 or YUY2 frame into packed RGB24, the form the pipeline's GPU path and
-//! pixel repair take.
+//! Raw NV12 or YUY2 to packed RGB24.
 
 use crate::{Error, Pixels, Result};
 
@@ -22,11 +21,9 @@ fn rgb(matrix: [i32; 4], luma: u8, cb: u8, cr: u8) -> [u8; 3] {
     ]
 }
 
-/// Converts a raw frame of `width` by `height` into `out` as RGB24, replacing its contents.
-///
+/// Replaces `out` with the frame as RGB24.
 /// # Errors
-///
-/// Fails when the size is odd where the layout needs it even, or `src` is too short.
+/// Fails on an odd size the layout can't take, or a short `src`.
 pub fn to_rgb(
     pixels: Pixels,
     width: u32,
@@ -42,7 +39,7 @@ pub fn to_rgb(
     {
         return Err(short());
     }
-    out.clear();
+    // Every byte is written below, so a frame the same size as the last skips the zeroing.
     out.resize(w * h * 3, 0);
     let rows = out.chunks_exact_mut(w * 3);
     match pixels {
@@ -89,7 +86,6 @@ mod tests {
         assert_eq!(rgb(BT601, 16, 128, 128), [0, 0, 0]);
         assert_eq!(rgb(BT601, 235, 128, 128), [255, 255, 255]);
         assert_eq!(rgb(BT709, 126, 128, 128), [128, 128, 128]);
-        // Full red, green and blue in each standard's limited-range coding.
         assert!(close(&rgb(BT601, 81, 90, 240), &[255, 0, 0]));
         assert!(close(&rgb(BT601, 145, 54, 34), &[0, 255, 0]));
         assert!(close(&rgb(BT601, 41, 240, 110), &[0, 0, 255]));
@@ -100,7 +96,6 @@ mod tests {
 
     #[test]
     fn nv12_shares_chroma_across_two_rows_and_two_columns() {
-        // A 4x2 frame: the left pair is red, the right pair is blue.
         let mut src = vec![81, 81, 41, 41, 81, 81, 41, 41];
         src.extend([90, 240, 240, 110]);
         let mut out = Vec::new();

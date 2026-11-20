@@ -2,6 +2,7 @@ use std::ops::RangeInclusive;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
+use std::time::Duration;
 
 use canon::{Prop, values};
 use eframe::egui::{
@@ -20,10 +21,9 @@ use crate::general::{self, Close};
 use crate::pipeline::Look;
 use crate::worker::{Command, Hub, Status, lock};
 
-/// The mode dial on M, and the lens switch on MF, as the body reports them.
+/// The body's codes for the mode dial on M and the lens switch on MF.
 const MODE_M: u32 = 3;
 const FOCUS_MF: u32 = 3;
-/// White balance set to a colour temperature in Kelvin.
 const WB_KELVIN: u32 = 9;
 
 mod card;
@@ -31,10 +31,10 @@ mod chrome;
 pub(crate) mod demo;
 mod finish;
 mod switcher;
+mod wizard;
 
 // Keepsake's inks, on a neutral ground so the picture's colour is judged against nothing.
 const GROUND: Color32 = Color32::from_rgb(0x0a, 0x0a, 0x0a);
-/// The recess behind pictures.
 const MAT: Color32 = Color32::from_rgb(0x05, 0x05, 0x05);
 const HOVER_SHEET: Color32 = Color32::from_rgb(0x12, 0x12, 0x12);
 const PRESSED_SHEET: Color32 = Color32::from_rgb(0x1a, 0x1a, 0x1a);
@@ -42,26 +42,18 @@ const RULE: Color32 = Color32::from_rgb(0x2f, 0x2f, 0x2e);
 const ROW_RULE: Color32 = Color32::from_rgb(0x1d, 0x1d, 0x1c);
 /// The outline of every control, at 3:1 against the ground.
 const EDGE: Color32 = Color32::from_rgb(0x62, 0x61, 0x5d);
-/// Plot Ink, and two steps down from it.
 const INK: Color32 = Color32::from_rgb(0xec, 0xeb, 0xe6);
 const DIM: Color32 = Color32::from_rgb(0xae, 0xad, 0xa7);
 const FAINT: Color32 = Color32::from_rgb(0x8d, 0x8c, 0x86);
-/// The one item in hand: on air.
 const RED: Color32 = Color32::from_rgb(0xd8, 0x32, 0x2b);
-/// Failure text, light enough to read at body size.
 const WARN: Color32 = Color32::from_rgb(0xf2, 0x66, 0x5b);
-/// The colour code of the timed stages, always beside their names.
 const DECODE: Color32 = Color32::from_rgb(0x2f, 0x66, 0xd8);
 const REPAIR: Color32 = Color32::from_rgb(0x3c, 0x9a, 0x5f);
 const GPU: Color32 = Color32::from_rgb(0xe2, 0xb0, 0x0e);
 const OUTPUT: Color32 = INK;
-/// Off, or not known.
 const UNKNOWN: Color32 = Color32::from_rgb(0x6b, 0x6a, 0x66);
-/// Label type's size. Capitals never go smaller.
 const LABEL: f32 = 11.0;
-/// The smallest window the layout is made for, in points. main.rs sets the same at zoom 1.
 pub(crate) const MIN_SIZE: Vec2 = Vec2::new(860.0, 520.0);
-/// How long Reset All Settings waits for its second press, in seconds.
 const ARMED_FOR: f64 = 3.5;
 
 pub(crate) use card::hidden_card;
@@ -75,11 +67,8 @@ pub(crate) struct App {
     commands: Sender<Command>,
     quitting: Arc<AtomicBool>,
     texture: Option<TextureHandle>,
-    /// The camera's own picture for Preview, from the last Compare or `Hub::want_original`.
     still: Option<TextureHandle>,
-    /// When a fresh still was last asked for, in egui's time.
     still_asked: f64,
-    /// The preview's pixels, shared with the painter until it has uploaded them.
     image: Arc<ColorImage>,
     histogram: Vec<u32>,
     saved_look: Look,
@@ -87,34 +76,25 @@ pub(crate) struct App {
     saved_adjust: Adjust,
     /// Off in the demo, so trying its controls never touches the real saved settings.
     persist: bool,
-    /// None in the demo and the tests, which show made-up cameras.
     cameras: Option<Vec<capture::Choice>>,
-    /// `capture::changes` when the list was last made.
     listed: Option<u64>,
-    /// A list being made off the UI thread, since Windows can be slow over it.
+    /// Listed off the UI thread, since Windows can be slow to list devices.
     listing: Option<Receiver<Vec<capture::Choice>>>,
     rounded: bool,
-    /// The still's pixels, kept like `image` so a fresh still is copied in place.
     still_image: Arc<ColorImage>,
     bus: switcher::Bus,
-    /// When Windows' settings were last read, in egui's time.
     system_checked: f64,
-    /// The Text size last applied, and the zoom the minimum window size was last set for.
     text_scale: f32,
     min_zoom: f32,
-    /// The tray's Hide Camera item and icon, from main. None in the demo and the tests.
     pub(crate) tray: Option<crate::Tray>,
-    /// Whether the tray's item says Show Camera.
     tray_says_show: bool,
     saved_general: general::Prefs,
-    /// Whether the Run value is there.
     starts_with_windows: bool,
-    /// When Reset All Settings was pressed once, in egui's time.
     reset_armed: Option<f64>,
     /// The battery warning last given: 0 for none, 1 at 25% and 2 when almost empty.
     battery_warned: u8,
-    /// Keep on Top as the window last heard it.
     on_top: Option<bool>,
+    setup: wizard::Wizard,
 }
 
 impl App {
@@ -130,6 +110,10 @@ impl App {
         app.persist = true;
         app.starts_with_windows = general::starts_with_windows(general::RUN_KEY);
         app.on_top = Some(app.saved_general.on_top);
+        app.setup.card = crate::usage::nvidia().map(|c| c.name.clone());
+        app.setup.script = crate::setup::install_script();
+        app.setup.here = crate::setup::registered_here();
+        app.setup.open = wizard::Wizard::first_run();
         app
     }
 
@@ -177,6 +161,7 @@ impl App {
             reset_armed: None,
             battery_warned: 0,
             on_top: None,
+            setup: wizard::Wizard::new(),
         }
     }
 
@@ -244,7 +229,6 @@ impl App {
         }
     }
 
-    /// Lists the cameras when the window opens, and again whenever a device comes or goes.
     fn list_cameras(&mut self, ctx: &Context) {
         if let Some(rx) = &self.listing {
             match rx.try_recv() {
@@ -270,8 +254,6 @@ impl App {
         self.listing = Some(rx);
     }
 
-    /// Which camera to use. The chosen one stays listed while it's unplugged, and Viewfinder
-    /// waits for it rather than using another.
     fn camera_row(&self, ui: &mut Ui, status: &Status) {
         let chosen = lock(&self.hub.chosen).clone();
         let cameras = self.cameras.as_deref().unwrap_or_default();
@@ -283,7 +265,6 @@ impl App {
             .unwrap_or_else(|| format!("{} (Not Connected)", chosen.label()));
         let mut picked = None;
         row(ui, "Camera", |ui| {
-            // Wider than the other fields, since camera names run long.
             let r = egui::ComboBox::from_id_salt("Camera")
                 .width(210.0)
                 .truncate()
@@ -314,7 +295,6 @@ impl App {
         }
     }
 
-    /// Hide Camera, which isn't saved, so Viewfinder always starts with the camera shown.
     fn hide_row(&self, ui: &mut Ui, status: &Status) {
         let mut hidden = status.hidden;
         row(ui, "Hide Camera", |ui| {
@@ -332,22 +312,19 @@ impl App {
         }
     }
 
-    /// The mark and name, the camera and battery up to `column`, where the settings start,
-    /// and the tally beside the window's buttons.
     fn top_bar(ui: &Ui, bar: Rect, column: f32, status: &Status) {
         // The middle of the pixels above the rule, which lands on the pixel row below the bar.
         let ppp = ui.ctx().pixels_per_point();
         let mid = f32::midpoint((bar.top() * ppp).round(), (bar.bottom() * ppp).floor()) / ppp;
         let x = mark(ui.painter(), bar.left() + 16.0, mid) + 12.0;
-        let mut x = name(ui, x, mid) + 24.0;
-        // A readout with nothing to read is left out, not shown empty.
+        let mut x = name(ui, x, mid) + 20.0;
         let camera = status
             .camera
             .as_deref()
             .map(|m| m.trim_start_matches("Canon "));
         let battery = status.battery.map(values::battery_label);
         let room = column - 12.0 - x;
-        // Battery goes last, since it's the one worth knowing before a call.
+        // Battery gets room first, as it's the one worth knowing before a call.
         let battery_w = if battery.is_some() { 92.0 } else { 0.0 };
         let block =
             |x: f32, w: f32| Rect::from_min_size(Pos2::new(x, mid - 16.0), Vec2::new(w, 32.0));
@@ -370,16 +347,12 @@ impl App {
         );
     }
 
-    /// Hold to see the camera's own picture, as Lightroom's backslash does. Holding Space while
-    /// the key has focus does the same. Returns how wide the key came out.
     fn compare_button(&self, ui: &mut Ui, live: bool) -> f32 {
         if !live {
             ui.disable();
         }
         let key = live && ui.ctx().input(|i| i.key_down(Key::Backslash));
         let was = self.hub.compare.load(Ordering::Relaxed);
-        // The whole name and its shortcut where there's room beside the monitor's name, then
-        // the name alone, then just Compare.
         let room = ui.available_width() - 84.0;
         let (shown, shortcut) = if room >= 205.0 {
             ("Hold to Compare", Some("\\"))
@@ -388,9 +361,12 @@ impl App {
         } else {
             ("Compare", None)
         };
-        let r = push_key(ui, "Hold to Compare", shown, was, false, shortcut).on_hover_text(
-            "Shows the camera's picture before any processing. Backslash does the same.",
-        );
+        // A click-only button lets go after egui's 0.8 s click limit, so it senses drags too.
+        let r = push_key(ui, "Hold to Compare", shown, was, false, shortcut)
+            .interact(Sense::drag())
+            .on_hover_text(
+                "Shows the camera's picture before any processing. Backslash does the same.",
+            );
         let held = r.is_pointer_button_down_on()
             || (r.has_focus() && ui.input(|i| i.key_down(Key::Space)));
         self.hub
@@ -399,7 +375,6 @@ impl App {
         r.rect.width()
     }
 
-    /// The live picture fitted into `rect`, with any problem written over it.
     fn picture(&self, ui: &Ui, rect: Rect, status: &Status) {
         let Some(t) = &self.texture else { return };
         let painter = ui.painter_at(rect);
@@ -602,7 +577,7 @@ impl App {
         });
         ui.add_space(6.0);
         ui.horizontal(|ui| self.nudges(ui));
-        // The column's end, so the last row clears the window's bottom edge when scrolled to.
+        // So the last row clears the window's bottom edge when scrolled to.
         ui.add_space(18.0);
     }
 
@@ -626,8 +601,7 @@ impl App {
         }
     }
 
-    /// The levels behind the chain's keys. The keys switch the stages on and off.
-    fn processing_section(ui: &mut Ui, status: &Status, look: &mut Look) {
+    fn processing_section(&mut self, ui: &mut Ui, status: &Status, look: &mut Look) {
         section(ui, "Processing");
         let gpu = status.vsr_available && status.vsr_problem.is_none();
         if gpu {
@@ -659,11 +633,19 @@ impl App {
                 });
             }
         } else {
-            let why = status
-                .vsr_problem
-                .as_deref()
-                .unwrap_or("NVIDIA's libraries aren't installed, so noise reduction and super resolution are off. Run scripts\\install.ps1 to fetch them.");
+            let rtx = self.setup.rtx();
+            let why = status.vsr_problem.as_deref().unwrap_or(if rtx {
+                "NVIDIA's Video Effects aren't installed, so noise reduction and super resolution are off. Setup can download them."
+            } else {
+                "Noise reduction and super resolution need an NVIDIA RTX card, so they're off."
+            });
             note(ui, why, WARN);
+            if rtx {
+                ui.add_space(6.0);
+                if push_key(ui, "Open Setup", "Open Setup", false, false, None).clicked() {
+                    self.setup.open = true;
+                }
+            }
         }
         if !gpu || look.vsr_quality == 0 {
             row(ui, "Sharpening", |ui| {
@@ -671,7 +653,7 @@ impl App {
             });
         }
         if gpu {
-            smooth_note(ui, status, look);
+            smooth_note(ui, look);
         }
         if look.fix_pixels {
             let text = match status.stuck {
@@ -804,11 +786,17 @@ impl App {
             "Ctrl+Alt+H hides or shows the camera and Ctrl+Alt+F runs Autofocus, even while another app is in front.",
             FAINT,
         );
+        let mut open = false;
+        row(ui, "Setup", |ui| {
+            let r = push_key(ui, "Open Setup", "Open", false, false, None);
+            open = r.clicked();
+            r
+        });
+        self.setup.open |= open;
         *lock(&self.hub.general) = prefs;
         self.reset_all(ui, look);
     }
 
-    /// Reset All Settings, which asks for a second press within `ARMED_FOR` seconds.
     fn reset_all(&mut self, ui: &mut Ui, look: &mut Look) {
         ui.add_space(12.0);
         let now = ui.input(|i| i.time);
@@ -851,7 +839,7 @@ impl App {
         } else if r.clicked() {
             self.reset_armed = Some(now);
             ui.ctx()
-                .request_repaint_after(std::time::Duration::from_secs_f64(ARMED_FOR));
+                .request_repaint_after(Duration::from_secs_f64(ARMED_FOR));
         } else if !armed {
             self.reset_armed = None;
         }
@@ -897,8 +885,7 @@ impl App {
 }
 
 impl eframe::App for App {
-    /// eframe skips `ui` while the window is minimized or hidden but still calls this on every
-    /// repaint request, and the camera thread asks for one with each frame.
+    /// eframe calls this on every repaint, even while hidden and `ui` is skipped.
     fn logic(&mut self, ctx: &Context, frame: &mut eframe::Frame) {
         if !self.rounded
             && let Some(hwnd) = hwnd(frame)
@@ -941,8 +928,6 @@ impl eframe::App for App {
 }
 
 impl App {
-    /// Keeps the window, the tray and the battery warning in step with the settings, even
-    /// while the window is hidden.
     fn follow_prefs(&mut self, ctx: &Context, frame: &eframe::Frame) {
         let prefs = *lock(&self.hub.general);
         if self.on_top != Some(prefs.on_top) {
@@ -980,8 +965,7 @@ impl App {
         }
     }
 
-    /// A tray notification once as the battery reaches 25%, and again as it's almost empty.
-    /// The levels are the T3's own: 0 is Low, 5 is 25%, and the rest are higher.
+    /// The T3 reports a battery level of 0 as Low and 5 as 25%.
     fn warn_battery(&mut self, battery: Option<u32>, on: bool) {
         let level = match battery {
             Some(0) => 2,
@@ -1007,8 +991,6 @@ impl App {
         };
     }
 
-    /// Follows Windows' Text size and Show animations settings, read every couple of seconds.
-    /// Text size zooms the whole window, and the smallest window grows with it.
     #[expect(
         clippy::float_cmp,
         reason = "any change to the scale or zoom at all has to be acted on"
@@ -1020,7 +1002,6 @@ impl App {
             let scale = text_scale();
             if scale != self.text_scale {
                 self.text_scale = scale;
-                // No bigger than lets the smallest layout fit on this screen.
                 let fits = ctx.input(|i| i.viewport().monitor_size).map_or(scale, |m| {
                     let m = m * ctx.zoom_factor();
                     (m.x / MIN_SIZE.x).min(m.y * 0.9 / MIN_SIZE.y)
@@ -1067,16 +1048,15 @@ fn zoom_rows(ui: &mut Ui, look: &mut Look) {
     }
 }
 
-fn smooth_note(ui: &mut Ui, status: &Status, look: &Look) {
-    let (text, colour) = match (&status.smooth_problem, look.smooth, look.vsr_quality > 0) {
-        (Some(p), true, true) => (format!("Smooth Motion failed, so frames are paced without frame generation. {p}"), WARN),
-        (_, true, false) => ("Smooth Motion needs Super Resolution on.".to_owned(), WARN),
-        (_, true, true) => (
-            "Smooth Motion is on. Apps get an even 30 fps, and when the camera misses a frame, NVIDIA frame generation draws one in its place. It adds about 70 ms of delay."
+fn smooth_note(ui: &mut Ui, look: &Look) {
+    let (text, colour) = match (look.smooth, look.vsr_quality > 0) {
+        (true, false) => ("Smooth Motion needs Super Resolution on.".to_owned(), WARN),
+        (true, true) => (
+            "Smooth Motion is on. Apps get an even 30 fps, and when the camera misses a frame, the last one shows again. It adds about 70 ms of delay."
                 .to_owned(),
             FAINT,
         ),
-        (_, false, _) => (
+        (false, _) => (
             "Smooth Motion is off. Apps get each camera frame as it's ready, which comes out at about 22 different frames a second."
                 .to_owned(),
             FAINT,
@@ -1125,7 +1105,6 @@ fn white_note(ui: &mut Ui, status: &Status, creative: bool) {
     note(ui, text, colour);
 }
 
-/// Small text's line height, Keepsake's 1.45.
 const NOTE_LINE: f32 = 17.5;
 
 fn note(ui: &mut Ui, text: impl Into<String>, colour: Color32) {
@@ -1137,7 +1116,6 @@ fn note(ui: &mut Ui, text: impl Into<String>, colour: Color32) {
     );
 }
 
-/// Windows' Text size, from Settings, Accessibility, Text size, as a factor.
 #[expect(unsafe_code, reason = "reading the registry is a Win32 call")]
 fn text_scale() -> f32 {
     use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW};
@@ -1161,7 +1139,6 @@ fn text_scale() -> f32 {
     }
 }
 
-/// Windows' "Show animations" setting, under Accessibility, Visual effects.
 #[expect(unsafe_code, reason = "reading a system setting is a Win32 call")]
 fn animations_on() -> bool {
     use windows::Win32::UI::WindowsAndMessaging::{
@@ -1180,9 +1157,8 @@ fn animations_on() -> bool {
     read.is_err() || on.as_bool()
 }
 
-/// Copies an RGBA frame into `image` and its texture. A new 3.7 MB image and texture every
-/// frame came to 25,000 page faults a second, so the image is refilled once the painter has
-/// let go of it and the texture is updated where it is.
+/// A new 3.7 MB image and texture every frame came to 25,000 page faults a second, so
+/// both are reused in place.
 fn upload(
     ctx: &Context,
     name: &str,
@@ -1215,9 +1191,8 @@ fn hwnd(frame: &eframe::Frame) -> Option<HWND> {
     Some(HWND(h.hwnd.get() as *mut std::ffi::c_void))
 }
 
-/// Whether the window is showing and not minimized. egui only knows about minimized, and a
-/// window hidden in the tray would otherwise keep live view and super resolution running for
-/// nobody. A window started in the tray has no handle yet, and that counts as hidden.
+/// egui only knows minimized. A window hidden in the tray, or with no handle yet, is off
+/// screen too.
 #[expect(unsafe_code, reason = "asking about a window is a Win32 call")]
 fn on_screen(frame: &eframe::Frame) -> bool {
     use windows::Win32::UI::WindowsAndMessaging::{IsIconic, IsWindowVisible};
@@ -1227,7 +1202,6 @@ fn on_screen(frame: &eframe::Frame) -> bool {
     })
 }
 
-/// The window's restored place on the desktop, in pixels.
 #[expect(unsafe_code, reason = "reading a window's placement is a Win32 call")]
 fn window_place(hwnd: HWND) -> Option<[i32; 4]> {
     use windows::Win32::UI::WindowsAndMessaging::{GetWindowPlacement, WINDOWPLACEMENT};
@@ -1241,8 +1215,7 @@ fn window_place(hwnd: HWND) -> Option<[i32; 4]> {
     Some([r.left, r.top, r.right, r.bottom])
 }
 
-/// Puts the window back where it was. Windows moves it onto a screen if that place is now off
-/// every one, as when a monitor has been unplugged. It stays hidden if it was.
+/// Windows moves the window onto a screen if the saved place is now off every one.
 #[expect(unsafe_code, reason = "placing a window is a Win32 call")]
 fn restore_place(hwnd: HWND, [left, top, right, bottom]: [i32; 4]) {
     use windows::Win32::Foundation::RECT;
@@ -1293,8 +1266,7 @@ fn medium() -> FontFamily {
 const CAP_HEIGHT: f32 = 0.686;
 const NAME_SIZE: f32 = 17.0;
 
-/// The mark, 30 points square and centred on `mid`, laid out in whole physical pixels so the
-/// brackets stay sharp at any scale. Returns its right edge.
+/// Laid out in whole physical pixels so the brackets stay sharp at any scale.
 fn mark(p: &egui::Painter, left: f32, mid: f32) -> f32 {
     let ppp = p.pixels_per_point();
     let centre = mid * ppp;
@@ -1322,9 +1294,7 @@ fn mark(p: &egui::Painter, left: f32, mid: f32) -> f32 {
     (left + side) / ppp
 }
 
-/// The name with its capitals, not its line box, centred on `mid`. The size is nudged from 17
-/// so the capitals land on whole pixels, crisp at the top and the baseline. Returns its right
-/// edge.
+/// The size is nudged from 17 so the capitals land on whole pixels.
 fn name(ui: &Ui, left: f32, mid: f32) -> f32 {
     let p = ui.painter();
     let ppp = p.pixels_per_point();
@@ -1353,7 +1323,7 @@ fn name(ui: &Ui, left: f32, mid: f32) -> f32 {
         .unwrap_or_default();
     let at = (centre + cap / 2.0).round() / ppp;
     let left = (left * ppp).round() / ppp;
-    let width = galley.size().x - finish::trail(&galley);
+    let width = galley.size().x;
     let rect = Rect::from_min_size(
         Pos2::new(left, at - baseline),
         Vec2::new(width, galley.size().y),
@@ -1366,8 +1336,6 @@ fn name(ui: &Ui, left: f32, mid: f32) -> f32 {
     rect.right()
 }
 
-/// A Label head over its value, behind a Rule. Fixed width, so the bar stays put as the
-/// numbers change.
 fn stat(ui: &Ui, rect: Rect, name: &str, value: &str) {
     readout(
         &ui.interact(rect, egui::Id::unique(("stat", name)), Sense::hover()),
@@ -1401,7 +1369,6 @@ fn stat(ui: &Ui, rect: Rect, name: &str, value: &str) {
     );
 }
 
-/// Names something painted for screen readers, which can't read the painter.
 fn readout(r: &Response, text: impl Fn() -> String) {
     r.widget_info(|| WidgetInfo::labeled(Role::Label, true, text()));
 }
@@ -1420,20 +1387,17 @@ const fn tally_text(status: &Status) -> &'static str {
     }
 }
 
-/// The red block at the right end of a lit tally, as on Keepsake's primary button.
 const BLOCK: f32 = 9.0;
 
 fn tally_width(ui: &Ui, status: &Status) -> f32 {
     let words = ui.fonts_mut(|f| f.layout_job(finish::label_job(tally_text(status), LABEL, INK)));
-    13.0 + words.size().x - finish::trail(&words) + 13.0 + BLOCK
+    13.0 + words.size().x + 13.0 + BLOCK
 }
 
-/// Whether an app is taking the picture, like a studio camera's tally light.
 fn tally(ui: &Ui, rect: Rect, status: &Status) {
     let r = ui.interact(rect, egui::Id::unique("tally"), Sense::hover());
     readout(&r, || format!("Tally: {}", tally_text(status)));
     let p = ui.painter();
-    // Hidden keeps the red off, since no picture is on air, and lights the words and outline.
     let t = finish::lit(p, r.id, status.consumer.is_some() && !status.hidden);
     if t > 0.0 {
         let block = Rect::from_min_max(Pos2::new(rect.right() - BLOCK, rect.top()), rect.max);
@@ -1451,13 +1415,12 @@ fn tally(ui: &Ui, rect: Rect, status: &Status) {
     );
 }
 
-/// A Label block over a picture's corner. `lit` inverts it, for a picture that is live.
 fn plate(painter: &egui::Painter, rect: Rect, text: &str, lit: bool) {
     let (fill, ink) = if lit { (INK, GROUND) } else { (GROUND, INK) };
     let galley = painter.layout_job(finish::label_job(text, LABEL, ink));
     let tag = Rect::from_min_size(
         rect.min + Vec2::splat(10.0),
-        Vec2::new(galley.size().x - finish::trail(&galley) + 16.0, 22.0),
+        Vec2::new(galley.size().x + 16.0, 22.0),
     );
     painter.rect_filled(tag, 0, fill);
     finish::place(
@@ -1483,7 +1446,6 @@ fn section(ui: &mut Ui, title: &str) {
     ui.add_space(4.0);
 }
 
-/// A name and its control, joined for screen readers.
 fn row(ui: &mut Ui, name: &str, control: impl FnOnce(&mut Ui) -> Response) {
     ui.horizontal(|ui| {
         ui.set_min_height(38.0);
@@ -1494,8 +1456,7 @@ fn row(ui: &mut Ui, name: &str, control: impl FnOnce(&mut Ui) -> Response) {
     });
 }
 
-/// A button showing `shown`, which may be shorter than its name `text`, inverted while `on`.
-/// A `strong` one keeps a Plot Ink outline and inverts under the pointer.
+/// `shown` may be shorter than `text`, the name a screen reader gets.
 fn push_key(
     ui: &mut Ui,
     text: &str,
@@ -1506,7 +1467,7 @@ fn push_key(
 ) -> Response {
     let words = ui.fonts_mut(|f| f.layout_job(finish::label_job(shown, LABEL, INK)));
     let cap = if shortcut.is_some() { 28.0 } else { 0.0 };
-    let size = Vec2::new(words.size().x - finish::trail(&words) + 26.0 + cap, 32.0);
+    let size = Vec2::new(words.size().x + 26.0 + cap, 32.0);
     let (rect, r) = ui.allocate_exact_size(size, Sense::click());
     r.widget_info(|| WidgetInfo::labeled(Role::Button, ui.is_enabled(), text));
     let hot = r.hovered() || r.has_focus();
@@ -1549,20 +1510,18 @@ fn push_key(
     r
 }
 
-/// The one action in its group, outlined in Plot Ink.
 fn primary(ui: &mut Ui, text: &str) -> Response {
     push_key(ui, text, text, false, true, None)
 }
 
-/// A joined row of keys. As with Windows' radio buttons, Tab stops only on the chosen key and
-/// the arrow keys move the choice.
+/// As with Windows' radio buttons, Tab stops only on the chosen key and the arrows move it.
 fn segmented<T: PartialEq + Copy>(ui: &mut Ui, value: &mut T, options: &[(T, &str)]) -> Response {
     let height = 28.0;
     let widths: Vec<f32> = options
         .iter()
         .map(|o| {
             let g = ui.fonts_mut(|f| f.layout_job(finish::label_job(o.1, LABEL, INK)));
-            (g.size().x - finish::trail(&g) + 22.0).round()
+            (g.size().x + 22.0).round()
         })
         .collect();
     let total = Vec2::new(widths.iter().sum::<f32>(), height);
@@ -1678,7 +1637,6 @@ fn chevron(ui: &Ui, rect: Rect, _: &egui::style::WidgetVisuals, _: bool) {
         .line_segment([c + Vec2::new(0.0, h), c + Vec2::new(w, -h)], stroke);
 }
 
-/// An open menu's items invert under the pointer, as the chosen one does.
 fn menu(ui: &mut Ui) {
     let hovered = &mut ui.visuals_mut().widgets.hovered;
     hovered.weak_bg_fill = INK;
@@ -1693,7 +1651,6 @@ fn edge(ui: &Ui, r: &Response) {
     }
 }
 
-/// egui's slider for the dragging, keys and screen readers, drawn as Keepsake's volume.
 fn fader(ui: &mut Ui, value: &mut f32, range: RangeInclusive<f32>) -> Response {
     // How far egui keeps the handle's centre from the ends, as a share of its height.
     const INSET: f32 = 0.12;
@@ -1735,7 +1692,6 @@ fn fader(ui: &mut Ui, value: &mut f32, range: RangeInclusive<f32>) -> Response {
     r
 }
 
-/// One to three chevrons toward near (negative `step`) or far.
 #[expect(
     clippy::suboptimal_flops,
     reason = "mul_add would change rounding, and the drawing must stay the same"
@@ -1768,7 +1724,6 @@ fn chevrons(ui: &mut Ui, step: i8, size: f32, hint: &str) -> Response {
     r
 }
 
-/// The level spread as Keepsake's signal line, with a clipped end outlined in Warn.
 #[expect(
     clippy::suboptimal_flops,
     reason = "mul_add would change rounding, and the drawing must stay the same"
@@ -1834,7 +1789,6 @@ fn diagnostics(ui: &mut Ui, status: &Status) {
         (None, None) => "NVIDIA RTX",
     };
     row(ui, "GPU", |ui| ui.label(RichText::new(gpu).color(INK)));
-    // Under the name, since the name alone nearly fills the row.
     if let (Some(_), Some((words, colour))) = (card, state) {
         note(ui, words, colour);
     }
@@ -1890,8 +1844,6 @@ fn label(prop: Prop, v: u32) -> String {
     }
 }
 
-/// Archivo, Keepsake's face, in five static cuts with tabular figures. egui's own font stays
-/// behind each as the fallback for anything Archivo lacks.
 fn font_definitions() -> FontDefinitions {
     let mut defs = FontDefinitions::default();
     let fallback = defs
@@ -2003,8 +1955,7 @@ mod tests {
     use super::*;
     use crate::worker::Hub;
 
-    /// The window as eframe shows it, filling the viewport. kittest's own frame adds a margin
-    /// the real window doesn't have.
+    /// kittest's own frame adds a margin the real window doesn't have.
     fn harness(hub: Arc<Hub>, size: Vec2, ppp: f32, gpu: bool) -> Harness<'static, App> {
         let (tx, _rx) = std::sync::mpsc::channel();
         let app = App::with_context(
@@ -2034,8 +1985,7 @@ mod tests {
         )
     }
 
-    /// kittest's own wgpu setup on the integrated GPU, or failing that a software one. Never the
-    /// discrete GPU, which the app's own NVIDIA effects need.
+    /// The integrated or a software adapter, since the NVIDIA effects need the discrete GPU.
     fn integrated() -> egui_wgpu::WgpuSetup {
         use egui_wgpu::wgpu::DeviceType;
         let mut setup = egui_kittest::wgpu::default_wgpu_setup();
@@ -2051,7 +2001,6 @@ mod tests {
         setup
     }
 
-    /// Puts the demo's made-up camera into one of the states a render shows.
     fn set_state(name: &str, hub: &Hub, harness: &mut Harness<'_, App>) {
         match name {
             "compare" => {
@@ -2105,6 +2054,19 @@ mod tests {
                 (s.live, s.resting, s.consumer) = (false, true, None);
                 s.problem = Some("The camera stopped sending live view, probably from heat. Trying again in a minute.".into());
             }
+            "setup" => {
+                let mut s = lock(&hub.status);
+                (s.camera, s.live, s.battery, s.consumer, s.vsr_available) =
+                    (None, false, None, None, false);
+                s.vcam = Some("Windows refused to create the camera".into());
+                s.problem = Some(
+                    "Can't find the camera. Turn it on, or half-press the shutter if it's asleep."
+                        .into(),
+                );
+                drop(s);
+                harness.state_mut().setup.open = true;
+            }
+            "setup-ready" => harness.state_mut().setup.open = true,
             _ => {}
         }
         harness.run();
@@ -2125,6 +2087,8 @@ mod tests {
             "no-camera",
             "cooling",
             "hidden",
+            "setup",
+            "setup-ready",
         ] {
             for (size, suffix) in [(Vec2::new(1180.0, 660.0), ""), (MIN_SIZE, "-small")] {
                 shots.push((format!("{state}{suffix}"), state, size, 1.75));
@@ -2199,7 +2163,6 @@ mod tests {
         }
     }
 
-    /// Every name in the accessibility tree, a label's text included.
     fn names(harness: &Harness<'_, App>) -> Vec<String> {
         harness
             .root()
@@ -2220,7 +2183,6 @@ mod tests {
             .and_then(|n| n.accesskit_node().label())
     }
 
-    /// Tab reaches every control once, in reading order, and each says what it is.
     #[test]
     fn keyboard_reaches_everything_in_order() {
         let mut harness = harness(demo::hub(), Vec2::new(1180.0, 660.0), 1.75, false);
@@ -2290,6 +2252,7 @@ mod tests {
             "Hide to Tray",
             "Off",
             "On",
+            "Setup",
             "Reset All Settings",
             "Minimize",
             "Maximize",
@@ -2298,7 +2261,6 @@ mod tests {
         assert_eq!(order, expected);
     }
 
-    /// The arrow keys move a segmented choice, and focus goes with it.
     #[test]
     fn arrows_move_a_choice() {
         let hub = demo::hub();
@@ -2317,8 +2279,6 @@ mod tests {
         assert!(lock(&hub.look).fit, "back to Whole Picture");
     }
 
-    /// What's painted rather than laid out is still there for a screen reader, and a readout
-    /// with nothing in it isn't shown at all.
     #[test]
     fn painted_readouts_have_names() {
         let hub = demo::hub();
@@ -2362,7 +2322,56 @@ mod tests {
         }
     }
 
-    /// Reset All Settings takes a second press, and keeps the window's place.
+    #[test]
+    fn setup_opens_from_general_and_closes_with_done() {
+        let hub = demo::hub();
+        let mut harness = harness(hub.clone(), Vec2::new(1180.0, 660.0), 1.75, false);
+        harness.run();
+        while focused(&harness).as_deref() != Some("Setup") {
+            harness.key_press(Key::Tab);
+            harness.run();
+        }
+        harness.key_press(Key::Enter);
+        harness.run();
+        assert!(harness.state().setup.open);
+        let all = names(&harness);
+        for want in [
+            "Virtual Camera: Ready. Call apps can pick Viewfinder from their camera list.",
+            "Camera: Ready. Canon EOS REBEL T3 is connected.",
+            "Mode Dial: Ready. On M, so Viewfinder can set exposure and white balance.",
+            "NVIDIA Video Effects: Ready. Running on the NVIDIA GeForce RTX 4060 Laptop GPU.",
+        ] {
+            assert!(
+                all.iter().any(|n| n == want),
+                "{want:?} missing from {all:#?}"
+            );
+        }
+        set_state("setup", &hub, &mut harness);
+        let mut stops = Vec::new();
+        for _ in 0..10 {
+            harness.key_press(Key::Tab);
+            harness.run();
+            let name = focused(&harness).expect("every Tab stop has a name");
+            if stops.first() == Some(&name) {
+                break;
+            }
+            stops.push(name);
+        }
+        assert_eq!(
+            stops,
+            [
+                "Install", "Download", "Done", "Minimize", "Maximize", "Close"
+            ]
+        );
+        while focused(&harness).as_deref() != Some("Done") {
+            harness.key_press(Key::Tab);
+            harness.run();
+        }
+        harness.key_press(Key::Enter);
+        harness.run();
+        assert!(!harness.state().setup.open);
+    }
+
     #[test]
     fn reset_needs_a_second_press() {
         let hub = demo::hub();
@@ -2387,40 +2396,6 @@ mod tests {
         assert_eq!(general.window, Some([1, 2, 3, 4]));
     }
 
-    /// With Windows' animations off, a lamp lights in the same frame instead of fading in.
-    #[test]
-    fn lamps_switch_at_once_with_animations_off() {
-        for animate in [true, false] {
-            // kittest turns animations off after its setup hook, so this sets them each frame.
-            let mut harness = Harness::builder().with_step_dt(1.0 / 60.0).build_ui_state(
-                move |ui, (on, t): &mut (bool, f32)| {
-                    ui.ctx().all_styles_mut(|s| {
-                        s.animation_time = if animate {
-                            egui::Style::default().animation_time
-                        } else {
-                            0.0
-                        }
-                    });
-                    *t = finish::lit(ui.painter(), egui::Id::unique("lamp"), *on);
-                },
-                (false, 0.0),
-            );
-            harness.run();
-            harness.state_mut().0 = true;
-            harness.step();
-            let t = harness.state().1;
-            assert!(
-                if animate {
-                    t > 0.0 && t < 1.0
-                } else {
-                    t.to_bits() == 1.0f32.to_bits()
-                },
-                "animate {animate}, lit {t}"
-            );
-        }
-    }
-
-    /// A fresh frame or still reuses its pixels and texture once the painter has let go.
     #[test]
     fn pictures_are_copied_in_place() {
         let ctx = Context::default();
@@ -2429,7 +2404,7 @@ mod tests {
         upload(&ctx, "still", &mut texture, &mut image, [64, 36], &rgba);
         let (pixels, id) = (Arc::as_ptr(&image), texture.as_ref().map(TextureHandle::id));
         // What the painter does with each frame's upload.
-        drop(ctx.tex_manager().write().take_delta());
+        ctx.tex_manager().write().take_delta().clear();
         upload(&ctx, "still", &mut texture, &mut image, [64, 36], &rgba);
         assert_eq!(Arc::as_ptr(&image), pixels, "same pixels");
         assert_eq!(texture.as_ref().map(TextureHandle::id), id, "same texture");

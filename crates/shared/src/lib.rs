@@ -1,11 +1,9 @@
-//! The frame handoff between the Viewfinder app and its camera DLL.
-//!
-//! The DLL runs inside the Frame Server service (LOCAL SERVICE, session 0)
-//! and creates the mapping, since a normal user can't create `Global\`
-//! objects. The app opens it, reads what size and format the DLL wants,
-//! and writes frames into three slots guarded by a sequence counter.
+//! The frame handoff between the app and its camera DLL. The DLL runs in the Frame Server
+//! service (LOCAL SERVICE, session 0) and creates the mapping, since a normal user can't create
+//! `Global\` objects.
 
 use std::ptr::NonNull;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering, fence};
 
 use windows::Win32::Foundation::{
@@ -19,6 +17,7 @@ use windows::Win32::System::Memory::{
     CreateFileMappingW, FILE_MAP_READ, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
     OpenFileMappingW, PAGE_READWRITE, UnmapViewOfFile,
 };
+use windows::Win32::System::Registry::{HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ, RegGetValueW};
 use windows::Win32::System::SystemInformation::GetTickCount64;
 use windows_core::{GUID, HSTRING};
 
@@ -27,30 +26,61 @@ pub const CLSID: GUID = GUID::from_u128(0xD6F48B83_FB1F_4421_BE38_B81B93E940ED);
 /// [`CLSID`] in registry form.
 pub const CLSID_STR: &str = "{D6F48B83-FB1F-4421-BE38-B81B93E940ED}";
 
-/// `Local\` only works when the DLL is hosted in the user's own session,
-/// which is what the in-process tests do.
-const NAMES: [&str; 2] = ["Global\\Viewfinder-v1", "Local\\Viewfinder-v1"];
+/// `Local\` only works when the DLL is hosted in the user's own session, as in the tests.
+/// `VIEWFINDER_SHARED` renames the mapping so a test doesn't meet the installed app's.
+fn names() -> [String; 2] {
+    let base = std::env::var("VIEWFINDER_SHARED").unwrap_or_else(|_| "Viewfinder-v1".into());
+    [format!("Global\\{base}"), format!("Local\\{base}")]
+}
 
 const MAGIC: u32 = u32::from_le_bytes(*b"VFv1");
-/// How many frames the mapping holds, so the app can write one while the DLL reads another.
-pub const SLOTS: usize = 3;
-/// The widest frame either side can ask for.
-pub const MAX_WIDTH: u32 = 1920;
-/// The tallest frame either side can ask for.
-pub const MAX_HEIGHT: u32 = 1080;
-/// Bytes in one slot, enough for YUY2 at the largest size.
-pub const SLOT_BYTES: usize = (MAX_WIDTH * MAX_HEIGHT * 2) as usize;
+const SLOTS: usize = 3;
+const MAX_WIDTH: u32 = 1920;
+const MAX_HEIGHT: u32 = 1080;
+const SLOT_BYTES: usize = (MAX_WIDTH * MAX_HEIGHT * 2) as usize;
 const HEADER_BYTES: usize = 4096;
 const MAPPING_BYTES: usize = HEADER_BYTES + SLOTS * SLOT_BYTES;
 
-/// The NV12 fourcc, a Y plane then interleaved UV at half height.
+/// The NV12 fourcc.
 pub const NV12: u32 = u32::from_le_bytes(*b"NV12");
-/// The YUY2 fourcc, Y0 U Y1 V for each pair of pixels.
+/// The YUY2 fourcc.
 pub const YUY2: u32 = u32::from_le_bytes(*b"YUY2");
 
-/// LOCAL SERVICE, SYSTEM and admins get full access, and the interactive
-/// user can read and write. Nobody else can plant frames.
-const SDDL: &str = "D:(A;;GA;;;SY)(A;;GA;;;LS)(A;;GA;;;BA)(A;;GRGW;;;IU)";
+/// LOCAL SERVICE, SYSTEM and admins get full access, and the user who installed Viewfinder can
+/// read and write, so nobody else signed in can watch or replace the picture. Without a record
+/// of who that is, any signed-in user can.
+fn sddl() -> String {
+    let user = owner().unwrap_or_else(|| "IU".into());
+    format!("D:(A;;GA;;;SY)(A;;GA;;;LS)(A;;GA;;;BA)(A;;GRGW;;;{user})")
+}
+
+/// The SID install.ps1 records, kept only if it looks like one, since it goes into the SDDL.
+#[expect(unsafe_code, reason = "reading the registry is a Win32 call")]
+fn owner() -> Option<String> {
+    let mut sid = [0u16; 192];
+    let mut size = size_of_val(&sid) as u32;
+    // SAFETY: `size` says how many bytes `sid` holds, and both outlive the call.
+    unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            windows_core::w!(r"SOFTWARE\Viewfinder"),
+            windows_core::w!("User"),
+            RRF_RT_REG_SZ,
+            None,
+            Some(sid.as_mut_ptr().cast()),
+            Some(&raw mut size),
+        )
+    }
+    .ok()
+    .ok()?;
+    let len = (size as usize).div_euclid(2).saturating_sub(1);
+    let sid = String::from_utf16_lossy(sid.get(..len)?);
+    (sid.starts_with("S-1-")
+        && sid
+            .chars()
+            .all(|c| c == 'S' || c == '-' || c.is_ascii_digit()))
+    .then_some(sid)
+}
 
 #[repr(C)]
 struct Slot {
@@ -65,21 +95,21 @@ struct Slot {
 #[repr(C)]
 struct Header {
     magic: AtomicU32,
-    // Written by the DLL.
     want_width: AtomicU32,
     want_height: AtomicU32,
     want_fourcc: AtomicU32,
     /// `GetTickCount64` of the last sample request, 0 once the stream stops.
     consumer_tick: AtomicU64,
-    // Written by the app.
     producer_tick: AtomicU64,
     /// Index of the newest finished slot, or `u32::MAX` before the first.
     latest: AtomicU32,
     _pad: u32,
     slots: [Slot; SLOTS],
-    /// `MFGetSystemTime` of the DLL's next read, written by the DLL. Last so the fields before it
-    /// keep their offsets.
+    /// `MFGetSystemTime` of the DLL's next read. Last so the fields before it keep their offsets.
     next_read: AtomicI64,
+    /// Odd while the DLL changes the wanted format, so the app never reads half of a change.
+    /// After `next_read` for the same reason, and an older DLL leaves it at 0.
+    want_seq: AtomicU32,
 }
 
 const _: () = assert!(size_of::<Header>() <= HEADER_BYTES);
@@ -104,7 +134,7 @@ pub struct Format {
 }
 
 impl Format {
-    /// How many bytes one tightly packed frame takes.
+    /// Bytes in one tightly packed frame.
     #[must_use]
     pub const fn bytes(self) -> usize {
         let (w, h) = (self.width as usize, self.height as usize);
@@ -131,6 +161,8 @@ impl Format {
 pub struct Shared {
     handle: HANDLE,
     base: NonNull<u8>,
+    /// The last format [`Shared::wanted`] read steadily.
+    last_wanted: Mutex<Option<Format>>,
 }
 
 // SAFETY: the mapping is only touched through atomics and seqlocked slot copies.
@@ -142,20 +174,18 @@ unsafe impl Sync for Shared {}
 
 impl Shared {
     /// Creates the mapping, or opens it if it already exists. Called by the DLL.
-    ///
     /// # Errors
-    ///
-    /// Fails when Windows won't create or open the mapping under either name, or won't map it.
+    /// When Windows won't create, open or map it under either name.
     #[expect(
         unsafe_code,
         reason = "security descriptors and file mappings are Win32 calls"
     )]
     pub fn create() -> windows_core::Result<Self> {
         let mut sd = PSECURITY_DESCRIPTOR::default();
-        // SAFETY: the SDDL string is valid and `sd` is a live out pointer, freed with LocalFree below.
+        // SAFETY: the SDDL string is valid and `sd` is a live out pointer, freed below.
         unsafe {
             ConvertStringSecurityDescriptorToSecurityDescriptorW(
-                &HSTRING::from(SDDL),
+                &HSTRING::from(sddl()),
                 SDDL_REVISION_1,
                 &raw mut sd,
                 None,
@@ -167,7 +197,7 @@ impl Shared {
             bInheritHandle: false.into(),
         };
         let mut result = Err(windows_core::Error::empty());
-        for name in NAMES {
+        for name in names() {
             // SAFETY: `sa` outlives the call, and INVALID_HANDLE_VALUE asks for a pagefile mapping.
             result = unsafe {
                 CreateFileMappingW(
@@ -176,18 +206,18 @@ impl Shared {
                     PAGE_READWRITE,
                     0,
                     MAPPING_BYTES as u32,
-                    &HSTRING::from(name),
+                    &HSTRING::from(&name),
                 )
             };
-            // Opening an existing mapping asks for full access, which only
-            // LOCAL SERVICE has, so a second source in a user process opens it.
+            // Creating over an existing mapping asks for full access, which only LOCAL SERVICE
+            // has, so a second source in a user process opens it.
             if result.as_ref().is_err_and(|e| e.code() == E_ACCESSDENIED) {
                 // SAFETY: the name is a live HSTRING.
                 result = unsafe {
                     OpenFileMappingW(
                         (FILE_MAP_READ | FILE_MAP_WRITE).0,
                         false,
-                        &HSTRING::from(name),
+                        &HSTRING::from(&name),
                     )
                 };
             }
@@ -195,8 +225,7 @@ impl Shared {
                 break;
             }
         }
-        // SAFETY: `sd` came from ConvertStringSecurityDescriptorToSecurityDescriptorW, which
-        // says to free it with LocalFree, and nothing uses it after this.
+        // SAFETY: the SDDL call says to free `sd` with LocalFree, and nothing uses it after this.
         unsafe { LocalFree(Some(HLOCAL(sd.0))) };
         let shared = Self::map(result?)?;
         let header = shared.header();
@@ -207,21 +236,19 @@ impl Shared {
         Ok(shared)
     }
 
-    /// Opens a mapping the DLL made.
-    ///
+    /// Opens the mapping the DLL made.
     /// # Errors
-    ///
-    /// Fails while no app is using the camera, since the mapping doesn't exist yet.
+    /// While no app is using the camera, since the mapping doesn't exist yet.
     #[expect(unsafe_code, reason = "OpenFileMappingW is a Win32 call")]
     pub fn open() -> windows_core::Result<Self> {
         let mut result = Err(windows_core::Error::empty());
-        for name in NAMES {
+        for name in names() {
             // SAFETY: the name is a live HSTRING.
             result = unsafe {
                 OpenFileMappingW(
                     (FILE_MAP_READ | FILE_MAP_WRITE).0,
                     false,
-                    &HSTRING::from(name),
+                    &HSTRING::from(&name),
                 )
             };
             if result.is_ok() {
@@ -250,7 +277,13 @@ impl Shared {
                 unsafe { CloseHandle(handle).ok() };
                 Err(err)
             },
-            |base| Ok(Self { handle, base }),
+            |base| {
+                Ok(Self {
+                    handle,
+                    base,
+                    last_wanted: Mutex::new(None),
+                })
+            },
         )
     }
 
@@ -271,24 +304,27 @@ impl Shared {
         unsafe { self.base.as_ptr().add(HEADER_BYTES + i * SLOT_BYTES) }
     }
 
-    // DLL side.
-
-    /// Says which size and format the DLL wants frames in.
+    /// DLL side. The size and format it wants.
     pub fn set_wanted(&self, f: Format) {
         let h = self.header();
+        // Set rather than added to, so a count left odd by a writer that died mid change
+        // comes right on the next one.
+        let odd = h.want_seq.load(Ordering::Relaxed) | 1;
+        h.want_seq.store(odd, Ordering::Relaxed);
+        fence(Ordering::Release);
         h.want_width.store(f.width, Ordering::Relaxed);
         h.want_height.store(f.height, Ordering::Relaxed);
         h.want_fourcc.store(f.fourcc, Ordering::Relaxed);
+        h.want_seq.store(odd.wrapping_add(1), Ordering::Release);
     }
 
-    /// Marks the stream as running (`true`) or stopped.
+    /// DLL side. Marks the stream running or stopped.
     pub fn touch_consumer(&self, streaming: bool) {
         let tick = if streaming { now_ms() } else { 0 };
         self.header().consumer_tick.store(tick, Ordering::Release);
     }
 
-    /// Copies the newest frame into `dst` if it matches `want` and was
-    /// written in the last `max_age_ms`. Returns the frame number.
+    /// DLL side. Copies the newest frame if it matches `want` and is under `max_age_ms` old.
     #[expect(unsafe_code, reason = "the frame is copied out of shared memory")]
     pub fn read_latest(&self, want: Format, max_age_ms: u64, dst: &mut [u8]) -> Option<u64> {
         let h = self.header();
@@ -321,21 +357,18 @@ impl Shared {
         (slot.seq.load(Ordering::Relaxed) == before).then_some(frame)
     }
 
-    /// Records when the next sample goes out, in `MFGetSystemTime` units.
+    /// DLL side. When the next sample goes out, in `MFGetSystemTime` units.
     pub fn set_next_read(&self, at: i64) {
         self.header().next_read.store(at, Ordering::Release);
     }
 
-    // App side.
-
-    /// When the DLL reads next, in `MFGetSystemTime` units, or 0 if it never said.
+    /// App side. When the DLL reads next, or 0 if it never said.
     #[must_use]
     pub fn next_read(&self) -> i64 {
         self.header().next_read.load(Ordering::Acquire)
     }
 
-    /// What the DLL wants right now, or `None` when no app is streaming.
-    /// A stream counts as stopped once its last request is `idle_ms` old.
+    /// App side. `None` when no app is streaming, or the last request is `idle_ms` old.
     #[must_use]
     pub fn wanted(&self, idle_ms: u64) -> Option<Format> {
         let h = self.header();
@@ -343,20 +376,33 @@ impl Shared {
         if tick == 0 || now_ms().saturating_sub(tick) > idle_ms {
             return None;
         }
-        let f = Format {
-            width: h.want_width.load(Ordering::Relaxed),
-            height: h.want_height.load(Ordering::Relaxed),
-            fourcc: h.want_fourcc.load(Ordering::Relaxed),
-        };
-        f.valid().then_some(f)
+        // A change takes nanoseconds, but a writer can be preempted in the middle of one, so a
+        // miss gives its thread the core before trying again. A steady read is final.
+        for try_no in 0..8 {
+            if try_no > 0 {
+                std::thread::yield_now();
+            }
+            let before = h.want_seq.load(Ordering::Acquire);
+            let f = Format {
+                width: h.want_width.load(Ordering::Relaxed),
+                height: h.want_height.load(Ordering::Relaxed),
+                fourcc: h.want_fourcc.load(Ordering::Relaxed),
+            };
+            fence(Ordering::Acquire);
+            if before & 1 == 0 && h.want_seq.load(Ordering::Relaxed) == before {
+                let f = f.valid().then_some(f);
+                if let Ok(mut last) = self.last_wanted.lock() {
+                    *last = f;
+                }
+                return f;
+            }
+        }
+        self.last_wanted.lock().ok().and_then(|last| *last)
     }
 
-    /// Hands `fill` the next free slot to write a frame of format `f` into,
-    /// then publishes it unless `fill` returned false. Only one thread may write.
-    ///
+    /// App side. Publishes the slot `fill` wrote unless it returned false. One writer only.
     /// # Panics
-    ///
-    /// Panics if `f` isn't a format [`Shared::wanted`] could return.
+    /// If `f` isn't a format [`Shared::wanted`] could return.
     #[expect(unsafe_code, reason = "the frame is written into shared memory")]
     pub fn write(&self, f: Format, frame: u64, fill: impl FnOnce(&mut [u8]) -> bool) {
         assert!(f.valid(), "can't write a {f:?} frame");
@@ -375,7 +421,6 @@ impl Shared {
         // SAFETY: `i` is a real slot and a valid format fits SLOT_BYTES. The odd sequence number
         // keeps the DLL from trusting what it reads until this write is published.
         if !fill(unsafe { std::slice::from_raw_parts_mut(self.slot_ptr(i), f.bytes()) }) {
-            // Never published, since `latest` still points at the previous slot.
             slot.seq.fetch_add(1, Ordering::Release);
             return;
         }
@@ -385,14 +430,7 @@ impl Shared {
         slot.frame.store(frame, Ordering::Relaxed);
         slot.seq.fetch_add(1, Ordering::Release);
         h.latest.store(i as u32, Ordering::Release);
-        self.heartbeat();
-    }
-
-    /// Tells the DLL the app is alive even when no frame is new.
-    pub fn heartbeat(&self) {
-        self.header()
-            .producer_tick
-            .store(now_ms(), Ordering::Release);
+        h.producer_tick.store(now_ms(), Ordering::Release);
     }
 }
 

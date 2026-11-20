@@ -1,5 +1,4 @@
-//! Finds the face with the detector built into Windows, so white balance can go by skin. It
-//! runs on its own thread twice a second, on a small grey copy of the frame.
+//! Windows' own face detector, so white balance can go by skin.
 
 use std::sync::mpsc::{SyncSender, sync_channel};
 use std::sync::{Arc, Mutex};
@@ -13,9 +12,8 @@ use windows::Security::Cryptography::CryptographicBuffer;
 use crate::worker::{lock, log};
 
 const EVERY: Duration = Duration::from_millis(500);
-/// A face found longer ago than this has probably moved.
 const FRESH: Duration = Duration::from_secs(1);
-/// The grey copy is shrunk to about this wide, which still finds a face across a room.
+/// Still finds a face across a room.
 const WIDTH: usize = 480;
 
 /// In frame pixels.
@@ -36,7 +34,6 @@ struct Grey {
 
 type Found = Arc<Mutex<Option<(Instant, Face)>>>;
 
-/// Hands frames to the face thread, started on the first look, and keeps what it last found.
 #[derive(Default)]
 pub(crate) struct Finder {
     send: Option<SyncSender<Grey>>,
@@ -45,7 +42,6 @@ pub(crate) struct Finder {
 }
 
 impl Finder {
-    /// `pixels` is three bytes a pixel, RGB or YCbCr.
     pub(crate) fn look(&mut self, pixels: &[u8], width: usize, rgb: bool) {
         if width == 0 || self.sent.is_some_and(|t| t.elapsed() < EVERY) {
             return;
@@ -80,11 +76,10 @@ impl Finder {
             height,
             scale,
         };
-        // A full channel means the detector is busy, a closed one that it never started.
+        // Full means the detector is busy, closed that it never started.
         send.try_send(frame).ok();
     }
 
-    /// The face found in the last second, the biggest if there were several.
     pub(crate) fn face(&self) -> Option<Face> {
         lock(&self.found)
             .filter(|(t, _)| t.elapsed() < FRESH)

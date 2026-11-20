@@ -1,10 +1,5 @@
-//! Live view JPEG to NV12 or YUY2 at whatever size the camera DLL asks for.
-//!
-//! On the CPU path the JPEG is decoded straight to YCbCr, one fixed-point matrix turns JFIF's
-//! full-range BT.601 into the limited-range BT.709 apps assume for HD video, and the luma and
-//! chroma planes are resized separately. With super resolution on, it's decoded to RGB and
-//! NVIDIA's VideoSuperRes upscales the crop on the GPU. If that ever fails the CPU path takes
-//! over for good.
+//! Live view to limited range BT.709 NV12 or YUY2. If NVIDIA's VideoSuperRes ever fails on
+//! the GPU, the CPU path takes over for good.
 
 use std::path::PathBuf;
 use std::time::Instant;
@@ -22,7 +17,6 @@ use crate::adjust::Adjust;
 const FIXED: i32 = 1 << 16;
 const HALF: i32 = FIXED >> 1;
 
-/// User-facing picture settings.
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[expect(
     clippy::struct_excessive_bools,
@@ -31,38 +25,29 @@ const HALF: i32 = FIXED >> 1;
 pub struct Look {
     /// Where the 16:9 crop sits in the 3:2 frame, 0 is the top edge.
     pub framing: f32,
-    /// Unsharp mask strength on luma for the CPU path, 0 turns it off.
     pub sharpen: f32,
     /// VideoSuperRes `QualityLevel`, 0 turns the GPU path off.
     pub vsr_quality: u32,
-    /// VideoSuperRes `Strength`, 0 to 1.
     pub vsr_strength: f32,
-    /// Denoise level on the GPU before upscaling, 8 to 11, or 0 for none.
+    /// 8 to 11, or 0 for none.
     pub denoise: u32,
-    /// Whether hot and dead pixels get filled from their neighbours.
     pub fix_pixels: bool,
-    /// Show the whole 3:2 frame with black bars at the sides, rather than cropping to 16:9.
     pub fit: bool,
-    /// Pace apps at an even 30 fps with NVIDIA's frame generation. Needs the GPU path.
     pub smooth: bool,
-    /// Flip what apps get left for right.
     pub mirror: bool,
-    /// Turn what apps get upside down, for a camera clamped that way.
     pub upside_down: bool,
-    /// Digital zoom in percent, 100 to 200, cropped before super resolution.
+    /// Percent, 100 to 200.
     pub zoom: u32,
     /// Where a zoomed crop sits across the frame, 0 is the left edge.
     pub pan: f32,
-    /// Steer the crop to follow the face.
     pub auto_frame: bool,
 }
 
 impl Default for Look {
     fn default() -> Self {
-        // Sharpening 0.55 with grain left out lifts edges as much as 0.35 with it. Mode 3
-        // removed blocking without smearing text in the synthetic test, where the streaming
-        // modes greyed out fine detail. Denoise 10 took grain off flat areas by 12 to 17 dB
-        // and still gained on detail, for about 4 ms. Ultra cost the same and lost detail.
+        // Mode 3 takes out blocking without smearing text, where the streaming modes grey out
+        // fine detail. Denoise 10 takes 12 to 17 dB of grain off flat areas and still gains
+        // detail, for about 4 ms. Ultra costs the same and loses detail.
         Self {
             framing: 0.5,
             sharpen: 0.55,
@@ -81,20 +66,15 @@ impl Default for Look {
     }
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Default, PartialEq)]
 enum Source {
+    #[default]
     Ycc,
-    /// Byte offset and row stride of the cropped window in `decoded`.
     Rgb {
         offset: usize,
         stride: usize,
     },
 }
-
-/// `VideoFrameGeneration`'s medium mode. On a sliding test scene at the camera's size it took
-/// 4 to 6 ms and scored 34 to 45 dB against the true middle frame, where a plain blend scored
-/// 19 to 28. High mode scored about the same below 16 pixels of motion and took 30 ms.
-const FRAMEGEN_MODE: u32 = 1;
 
 /// Building a model takes about a second, so the last two sizes are kept.
 #[derive(Default)]
@@ -112,8 +92,12 @@ struct Model {
     sr: vsr::SuperRes,
 }
 
+#[derive(Default)]
 pub(crate) struct Pipeline {
     decoded: Vec<u8>,
+    /// Frames decode into this and swap with `decoded` only once they've worked, so a broken
+    /// one can't leave `decoded` resized under the last frame's geometry.
+    incoming: Vec<u8>,
     /// The decoded frame before `finish`, while Compare needs it.
     untouched: Vec<u8>,
     luma: Vec<u8>,
@@ -123,78 +107,26 @@ pub(crate) struct Pipeline {
     scratch_chroma: Vec<u8>,
     width: u32,
     height: u32,
-    matrix: [[i32; 3]; 3],
     resizer: Resizer,
     source: Source,
-    /// Whether `luma` and `chroma` hold the current frame, which an RGB decode only fills
-    /// when a frame has to be scaled down.
+    /// Whether `luma` and `chroma` hold this frame. An RGB decode only fills them to scale down.
     planes_fresh: bool,
     gpu: Gpu,
     repair: crate::pixels::Repair,
     staging: Vec<u8>,
     padded: Vec<u8>,
-    /// Recent decoded frames by number, oldest first, for drawing moments between them.
     held: std::collections::VecDeque<(u64, Vec<u8>)>,
     spare: Vec<Vec<u8>>,
     decoded_size: (usize, usize),
-    /// Whether `decoded` holds RGB rather than YCbCr.
     rgb: bool,
-    framegen: Option<vsr::FrameGen>,
-    framegen_failed: Option<String>,
-    /// Whether `render` flips its output left for right, and upside down.
     turn: (bool, bool),
-    /// Frame numbers now uploaded to `framegen` as its earlier and later frame.
-    pair: Option<(u64, u64)>,
-    /// Whether the current frame is the one `framegen` drew, which stays on the GPU and
-    /// leaves `decoded` stale until something on the CPU needs it.
-    generated: bool,
-    /// The number of the camera frame last sent out as it is.
-    shown: Option<u64>,
     adjusting: crate::adjust::Pass,
     builds: u32,
     /// Milliseconds per stage since the caller last took them, indexed by `DECODE` and the rest.
     pub(crate) times: [f32; 4],
 }
 
-impl Default for Pipeline {
-    fn default() -> Self {
-        Self {
-            decoded: Vec::new(),
-            untouched: Vec::new(),
-            luma: Vec::new(),
-            chroma: Vec::new(),
-            blur: Vec::new(),
-            scratch_luma: Vec::new(),
-            scratch_chroma: Vec::new(),
-            width: 0,
-            height: 0,
-            matrix: bt601_full_to_bt709_limited(),
-            resizer: Resizer::new(),
-            source: Source::Ycc,
-            planes_fresh: false,
-            gpu: Gpu::default(),
-            repair: crate::pixels::Repair::default(),
-            staging: Vec::new(),
-            padded: Vec::new(),
-            held: std::collections::VecDeque::new(),
-            spare: Vec::new(),
-            decoded_size: (0, 0),
-            rgb: false,
-            framegen: None,
-            framegen_failed: None,
-            turn: (false, false),
-            pair: None,
-            generated: false,
-            shown: None,
-            adjusting: crate::adjust::Pass::default(),
-            builds: 0,
-            times: [0.0; 4],
-        }
-    }
-}
-
 impl Pipeline {
-    /// A pipeline that can upscale on the GPU with NVIDIA's DLLs from `vfx`.
     pub(crate) fn with_gpu(vfx: Option<PathBuf>) -> Self {
         let mut p = Self::default();
         p.gpu.dir = vfx;
@@ -205,7 +137,10 @@ impl Pipeline {
         self.repair.count()
     }
 
-    /// Why the GPU path was given up on, if it was.
+    pub(crate) fn avoid_eyes(&mut self, face: Option<crate::face::Face>) {
+        self.repair.avoid_eyes(face);
+    }
+
     pub(crate) fn gpu_problem(&self) -> Option<&str> {
         self.gpu.failed.as_deref()
     }
@@ -228,6 +163,7 @@ impl Pipeline {
             .decode_headers()
             .map_err(|e| format!("bad live view JPEG: {e:?}"))?;
         let (w, h) = decoder.dimensions().ok_or("live view JPEG has no size")?;
+        check_size(w, h)?;
         let len = decoder
             .output_buffer_size()
             .ok_or("live view JPEG has no size")?;
@@ -235,17 +171,16 @@ impl Pipeline {
             return Err(format!("live view JPEG is {w}x{h} but not 3-channel"));
         }
         let started = Instant::now();
-        self.decoded.resize(len, 0);
-        self.generated = false;
+        self.incoming.resize(len, 0);
         decoder
-            .decode_into(&mut self.decoded)
+            .decode_into(&mut self.incoming)
             .map_err(|e| format!("bad live view JPEG: {e:?}"))?;
+        std::mem::swap(&mut self.decoded, &mut self.incoming);
         self.times[DECODE] += ms_since(started);
         self.place(w, h, !gpu, look);
         Ok(())
     }
 
-    /// Takes a JPEG as `decode` does, or a raw frame by way of RGB.
     pub(crate) fn decode_frame(
         &mut self,
         frame: &[u8],
@@ -261,17 +196,16 @@ impl Pipeline {
         else {
             return self.decode(frame, look);
         };
+        check_size(width as usize, height as usize)?;
         let started = Instant::now();
-        capture::convert::to_rgb(pixels, width, height, bt709, frame, &mut self.decoded)
+        capture::convert::to_rgb(pixels, width, height, bt709, frame, &mut self.incoming)
             .map_err(|e| e.to_string())?;
-        self.generated = false;
+        std::mem::swap(&mut self.decoded, &mut self.incoming);
         self.times[DECODE] += ms_since(started);
         self.place(width as usize, height as usize, false, look);
         Ok(())
     }
 
-    /// Repairs, crops and converts the frame in `decoded`, which is YCbCr when `ycc` and RGB
-    /// otherwise.
     fn place(&mut self, w: usize, h: usize, ycc: bool, look: Look) {
         let gpu = self.gpu_path(look);
         self.decoded_size = (w, h);
@@ -283,7 +217,9 @@ impl Pipeline {
         }
 
         let (cw, ch) = crop_size((w, h), look);
-        let left = ((w - cw) as f32 * look.pan.clamp(0.0, 1.0)).floor() as usize;
+        // Pan only shows when zoomed, so at 1x a wide picture that loses its sides stays centred.
+        let pan = if look.zoom > 100 { look.pan } else { 0.5 };
+        let left = ((w - cw) as f32 * pan.clamp(0.0, 1.0)).floor() as usize;
         let top = ((h - ch) as f32 * look.framing.clamp(0.0, 1.0)).round() as usize;
         self.turn = (look.mirror, look.upside_down);
         self.width = cw as u32;
@@ -310,7 +246,7 @@ impl Pipeline {
         self.source = Source::Ycc;
         let started = Instant::now();
         let (matrix, centre) = if ycc {
-            (self.matrix, 128)
+            (bt601_full_to_bt709_limited(), 128)
         } else {
             (rgb_to_bt709_limited(), 0)
         };
@@ -321,7 +257,7 @@ impl Pipeline {
         self.times[OUTPUT] += ms_since(started);
     }
 
-    /// The last decoded frame, uncropped, with its width and whether it's RGB rather than YCbCr.
+    /// The last decoded frame uncropped, its width, and whether it's RGB rather than YCbCr.
     pub(crate) fn frame(&self) -> (&[u8], usize, bool) {
         (&self.decoded, self.decoded_size.0, self.rgb)
     }
@@ -330,17 +266,11 @@ impl Pipeline {
         look.vsr_quality > 0 && self.gpu.dir.is_some() && self.gpu.failed.is_none()
     }
 
-    /// Frame generation needs RGB frames from the GPU path.
     pub(crate) const fn can_smooth(&self, look: Look) -> bool {
         look.smooth && self.gpu_path(look)
     }
 
-    pub(crate) fn smooth_problem(&self) -> Option<&str> {
-        self.framegen_failed.as_deref()
-    }
-
-    /// Takes a colour cast out of the frame just decoded and applies the Adjust sliders, in
-    /// one pass. With `keep` the frame as it came is kept for Compare.
+    /// Takes `cast` out and applies Adjust in one pass. `keep` holds the original for Compare.
     // RGB only, so the CPU path without an NVIDIA card keeps the camera's colour.
     pub(crate) fn finish(&mut self, cast: Option<crate::white::Cast>, adjust: &Adjust, keep: bool) {
         self.untouched.clear();
@@ -366,8 +296,6 @@ impl Pipeline {
         self.times[REPAIR] += ms_since(started);
     }
 
-    /// Adjust sliders picked for the frame just decoded with `cast` taken out, or None when
-    /// the frame isn't RGB.
     pub(crate) fn auto(
         &self,
         cast: Option<crate::white::Cast>,
@@ -418,11 +346,10 @@ impl Pipeline {
 
     pub(crate) fn forget(&mut self) {
         self.spare.extend(self.held.drain(..).map(|(_, f)| f));
-        self.pair = None;
     }
 
-    /// Makes the current frame the moment `at` frames along the held ones, so 4.25 is a
-    /// quarter of the way from frame 4 to frame 5. Frames before `at` are dropped.
+    /// Makes the current frame the held one nearest `at` frames along, so 4.25 shows frame 4.
+    /// Frames before `at` are dropped.
     pub(crate) fn show_at(&mut self, at: f64) {
         let base = at.floor() as u64;
         while self.held.len() > 1
@@ -434,11 +361,9 @@ impl Pipeline {
         let Some(&(first, _)) = self.held.front() else {
             return;
         };
-        let t = at - base as f64;
         let next = self.held.iter().position(|(seq, _)| *seq == base + 1);
-        let between = base == first && (0.04..=0.96).contains(&t);
         let pick = match next {
-            Some(i) if base == first && t >= 0.5 => i,
+            Some(i) if base == first && at - base as f64 >= 0.5 => i,
             _ if base < first => 0,
             _ => self
                 .held
@@ -446,96 +371,21 @@ impl Pipeline {
                 .rposition(|(seq, _)| *seq <= base)
                 .unwrap_or(0),
         };
-        // A camera frame that hasn't gone out yet goes out as it is. Drawn frames warp the
-        // background a little, so they only fill in where the same frame would repeat.
-        let repeat = self
-            .held
-            .get(pick)
-            .is_some_and(|(seq, _)| self.shown == Some(*seq));
-        if let Some(i) = next
-            && between
-            && repeat
-            && self.framegen_failed.is_none()
-        {
-            let started = Instant::now();
-            let generated = self.generate(i, t as f32);
-            self.times[GPU] += ms_since(started);
-            match generated {
-                Ok(()) => {
-                    self.planes_fresh = false;
-                    self.generated = true;
-                    return;
-                }
-                Err(e) => self.framegen_failed = Some(e),
-            }
-        }
-        if let Some((seq, frame)) = self.held.get(pick) {
+        if let Some((_, frame)) = self.held.get(pick) {
             self.decoded.clone_from(frame);
-            self.shown = Some(*seq);
         }
         self.planes_fresh = false;
-        self.generated = false;
     }
 
-    /// Draws the moment `t` between the first held frame and held frame `next`, on the GPU.
-    fn generate(&mut self, next: usize, t: f32) -> Result<(), String> {
-        let stride = self.decoded_size.0 * 3;
-        self.build_framegen()?;
-        let generator = self.framegen.as_mut().ok_or(NO_FRAMEGEN)?;
-        let (Some((first, earlier)), Some((second, later))) =
-            (self.held.front(), self.held.get(next))
-        else {
-            return Err("no held frames to draw between".into());
-        };
-        let pair = Some((*first, *second));
-        if self.pair != pair {
-            self.pair = None;
-            generator.upload(0, earlier, stride)?;
-            generator.upload(1, later, stride)?;
-            self.pair = pair;
-        }
-        generator.draw(t)
-    }
-
-    fn build_framegen(&mut self) -> Result<(), String> {
-        if self.framegen.is_none() {
-            let (w, h) = self.decoded_size;
-            let dir = self
-                .gpu
-                .dir
-                .as_deref()
-                .ok_or("NVIDIA's libraries aren't installed")?;
-            self.framegen = Some(vsr::FrameGen::new(
-                dir,
-                (w as u32, h as u32),
-                FRAMEGEN_MODE,
-            )?);
-            self.pair = None;
-            self.builds += 1;
-        }
-        Ok(())
-    }
-
-    /// Builds the GPU passes a call at `out` will use and runs each once on the last frame, since
-    /// a fresh pass takes another 0.1 to 0.2 s the first time. All of it takes about a second.
-    /// Before the first frame the camera's size isn't known, so it does nothing.
+    /// Builds and runs once the GPU passes `out` will use, since a fresh pass takes another 0.1
+    /// to 0.2 s its first time. All of it takes about a second.
     pub(crate) fn prepare(&mut self, out: Format, look: Look) {
-        if self.width == 0 || !self.gpu_path(look) || self.gpu.settings.is_none() {
+        if self.width == 0
+            || self.height == 0
+            || !self.gpu_path(look)
+            || self.gpu.settings.is_none()
+        {
             return;
-        }
-        self.bring_back().ok();
-        if self.can_smooth(look) && self.framegen_failed.is_none() {
-            let w = self.decoded_size.0;
-            let warmed = self.build_framegen().and_then(|()| {
-                let g = self.framegen.as_mut().ok_or(NO_FRAMEGEN)?;
-                g.upload(0, &self.decoded, w * 3)?;
-                g.upload(1, &self.decoded, w * 3)?;
-                g.draw(0.5)
-            });
-            self.pair = None;
-            if let Err(e) = warmed {
-                self.framegen_failed = Some(e);
-            }
         }
         // A failure here is recorded by render, as it would be on a real frame.
         let mut scratch = vec![0; out.bytes()];
@@ -546,16 +396,12 @@ impl Pipeline {
         self.builds
     }
 
-    /// Whether any GPU passes are built, holding video memory.
     pub(crate) const fn on_gpu(&self) -> bool {
-        !self.gpu.models.is_empty() || self.framegen.is_some()
+        !self.gpu.models.is_empty()
     }
 
-    /// Gives back the GPU passes and the frames kept for pacing. `prepare` builds them again.
     pub(crate) fn release(&mut self) {
-        self.bring_back().ok();
         self.gpu.models.clear();
-        self.framegen = None;
         self.forget();
         self.spare = Vec::new();
         for buf in [
@@ -569,27 +415,6 @@ impl Pipeline {
         }
     }
 
-    /// Brings a generated frame back into `decoded` for work on the CPU.
-    fn bring_back(&mut self) -> Result<(), String> {
-        if !self.generated {
-            return Ok(());
-        }
-        let (w, h) = self.decoded_size;
-        self.decoded.resize(w * h * 3, 0);
-        let started = Instant::now();
-        let downloaded = self
-            .framegen
-            .as_mut()
-            .ok_or("no generated frame")?
-            .download(&mut self.decoded, w * 3);
-        self.times[GPU] += ms_since(started);
-        downloaded?;
-        self.generated = false;
-        Ok(())
-    }
-
-    /// Converts the cropped window of `decoded` into `luma` and full-size interleaved
-    /// `chroma`. `centre` is 128 when the second and third channels are signed chroma.
     fn fill_planes(&mut self, offset: usize, stride: usize, m: [[i32; 3]; 3], centre: i32) {
         let (cw, ch) = (self.width as usize, self.height as usize);
         self.luma.resize(cw * ch, 0);
@@ -614,7 +439,7 @@ impl Pipeline {
                     i32::from(px[1]) - centre,
                     i32::from(px[2]) - centre,
                 );
-                // Chroma can be negative, and checked_div truncates toward zero like `/` does.
+                // checked_div truncates negative chroma toward zero like `/` does.
                 let mix = |r: [i32; 3], offset: i32, lo: i32, hi: i32| {
                     ((r[0] * y + r[1] * cb + r[2] * cr + HALF)
                         .checked_div(FIXED)
@@ -628,10 +453,8 @@ impl Pipeline {
         }
     }
 
-    /// Renders the decoded picture into `dst`, scaled to the height of `out` and centred
-    /// between black bars when it's narrower.
     pub(crate) fn render(&mut self, out: Format, dst: &mut [u8]) -> Result<(), String> {
-        if self.width == 0 {
+        if self.width == 0 || self.height == 0 {
             return Err("nothing decoded yet".into());
         }
         let inner = self.fit(out);
@@ -654,7 +477,6 @@ impl Pipeline {
         result
     }
 
-    /// The largest even-width format of the picture's shape that `out` holds at full height.
     fn fit(&self, out: Format) -> Format {
         let width = (u64::from(out.height) * u64::from(self.width))
             .div_euclid(u64::from(self.height)) as u32;
@@ -666,20 +488,20 @@ impl Pipeline {
 
     fn render_exact(&mut self, out: Format, dst: &mut [u8]) -> Result<(), String> {
         // VideoSuperRes only scales up, and scaling down hides noise anyway.
-        if let Source::Rgb { offset, stride } = self.source
-            && out.height < self.height
-        {
+        if let Source::Rgb { offset, stride } = self.source {
+            // After a GPU failure the rest of the frame, the preview included, goes to the CPU
+            // instead of building another model for a second.
+            if out.height >= self.height && self.gpu.failed.is_none() {
+                let result = self.render_gpu(out, dst, offset, stride);
+                if let Err(e) = &result {
+                    self.gpu.failed = Some(e.clone());
+                    self.gpu.models.clear();
+                }
+                return result;
+            }
             if !self.planes_fresh {
-                self.bring_back()?;
                 self.fill_planes(offset, stride, rgb_to_bt709_limited(), 0);
             }
-        } else if let Source::Rgb { offset, stride } = self.source {
-            let result = self.render_gpu(out, dst, offset, stride);
-            if let Err(e) = &result {
-                self.gpu.failed = Some(e.clone());
-                self.gpu.models.clear();
-            }
-            return result;
         }
         let (w, h) = (out.width, out.height);
         let luma_bytes = (w * h) as usize;
@@ -718,7 +540,6 @@ impl Pipeline {
         Ok(())
     }
 
-    /// Which of `gpu.models` takes the current picture size to `output`, built if need be.
     fn model(&mut self, output: (u32, u32)) -> Result<usize, String> {
         let dir = self.gpu.dir.as_deref().ok_or("no NVIDIA libraries")?;
         let settings = self.gpu.settings.ok_or("no super resolution settings")?;
@@ -764,16 +585,11 @@ impl Pipeline {
             .decoded
             .get(offset..)
             .ok_or("the crop is outside the frame")?;
-        let (pixel, row) = (offset.div_euclid(3), stride.div_euclid(3));
-        let (left, top) = (pixel.rem_euclid(row) as u32, pixel.div_euclid(row) as u32);
         // The call blocks until the GPU is done, so timing around it needs no extra sync.
         let mut gpu = 0.0;
         let mut run = |nv12: &mut [u8]| {
             let started = Instant::now();
-            let result = match self.framegen.as_ref().filter(|_| self.generated) {
-                Some(g) => model.run_from(g, left, top, nv12),
-                None => model.run(window, stride, nv12),
-            };
+            let result = model.run(window, stride, nv12);
             gpu += ms_since(started);
             result
         };
@@ -801,11 +617,7 @@ impl Pipeline {
         result
     }
 
-    /// RGBA at half the cropped size, for the preview window.
-    pub(crate) fn preview(&mut self, rgba: &mut Vec<u8>) -> (usize, usize) {
-        if self.bring_back().is_err() {
-            self.framegen_failed = Some("the generated frame couldn't be read back".into());
-        }
+    pub(crate) fn preview(&self, rgba: &mut Vec<u8>) -> (usize, usize) {
         let (w, h) = (self.width as usize, self.height as usize);
         let (pw, ph) = (w.div_euclid(2), h.div_euclid(2));
         rgba.clear();
@@ -856,13 +668,11 @@ impl Pipeline {
     }
 }
 
-/// Indexes into `Pipeline::times`.
 pub(crate) const DECODE: usize = 0;
 pub(crate) const REPAIR: usize = 1;
 pub(crate) const GPU: usize = 2;
 pub(crate) const OUTPUT: usize = 3;
 
-/// White balance's tables for `cast`, or tables that change nothing.
 fn balance_lut(cast: Option<crate::white::Cast>) -> [[u8; 256]; 3] {
     cast.map_or_else(
         || [std::array::from_fn(|c| c as u8); 3],
@@ -880,7 +690,6 @@ enum Plane {
     Chroma,
 }
 
-const NO_FRAMEGEN: &str = "frame generation isn't built";
 const NO_MODEL: &str = "the super resolution model went missing";
 
 fn frame_of(dst: &mut [u8], f: Format) -> Result<&mut [u8], String> {
@@ -889,7 +698,6 @@ fn frame_of(dst: &mut [u8], f: Format) -> Result<&mut [u8], String> {
         .ok_or_else(|| format!("{len} bytes is too small for a {f:?} frame"))
 }
 
-/// Copies `picture` into the middle of `dst` and paints the sides video-range black.
 fn pillarbox(inner: Format, picture: &[u8], out: Format, dst: &mut [u8]) {
     let (iw, ow, h) = (
         inner.width as usize,
@@ -935,9 +743,8 @@ fn pillarbox(inner: Format, picture: &[u8], out: Format, dst: &mut [u8]) {
     }
 }
 
-/// RGBA from a rendered NV12 or YUY2 frame, so the preview shows exactly what apps get.
-/// Frames wider than 1280 are halved, which still covers the preview on a 4K screen. A row at
-/// a time takes a 1080p frame in 0.8 ms, against 6.3 ms a byte at a time.
+/// RGBA of exactly what apps get. Halving frames wider than 1280 still covers a 4K screen. A
+/// row at a time takes a 1080p frame in 0.8 ms, against 6.3 ms a byte at a time.
 pub(crate) fn preview_output(f: Format, frame: &[u8], rgba: &mut Vec<u8>) -> (usize, usize) {
     let (w, h) = (f.width as usize, f.height as usize);
     let step = if w > 1280 { 2 } else { 1 };
@@ -995,7 +802,6 @@ pub(crate) fn preview_output(f: Format, frame: &[u8], rgba: &mut Vec<u8>) -> (us
     (pw, ph)
 }
 
-/// Fixed-point BT.709 video range to full-range RGB, 8 fractional bits.
 fn bt709_limited_to_rgba(y: u8, cb: u8, cr: u8) -> [u8; 4] {
     let y = (i32::from(y) - 16) * 298;
     let (cb, cr) = (i32::from(cb) - 128, i32::from(cr) - 128);
@@ -1008,7 +814,6 @@ fn bt709_limited_to_rgba(y: u8, cb: u8, cr: u8) -> [u8; 4] {
     ]
 }
 
-/// Repeats each NV12 chroma row for the two luma rows it covers.
 fn nv12_to_yuy2(nv12: &[u8], w: usize, h: usize, dst: &mut [u8]) {
     let (luma, chroma) = nv12.split_at(w * h);
     let chroma_rows = chroma.chunks_exact(w).flat_map(|uv| [uv, uv]);
@@ -1025,11 +830,26 @@ fn nv12_to_yuy2(nv12: &[u8], w: usize, h: usize, dst: &mut [u8]) {
     }
 }
 
-pub(crate) fn crop_size((w, h): (usize, usize), look: Look) -> (usize, usize) {
-    zoomed(if look.fit { (w, h) } else { crop_16_9(w, h) }, look.zoom)
+/// Live view is 1056 by 704 and webcams stop at 4K. A forged huge header costs hundreds of MB.
+const SIDES: std::ops::RangeInclusive<usize> = 16..=4096;
+
+fn check_size(w: usize, h: usize) -> Result<(), String> {
+    if SIDES.contains(&w) && SIDES.contains(&h) {
+        Ok(())
+    } else {
+        Err(format!(
+            "the camera sent a {w}x{h} frame, which can't be right"
+        ))
+    }
 }
 
-/// The middle `100 / zoom` of a `w` by `h` crop, with even sides for chroma.
+/// Every format apps can pick is 16:9, so a picture wider than that loses its sides even in
+/// Whole Picture, since the alternative is squashing it.
+pub(crate) fn crop_size((w, h): (usize, usize), look: Look) -> (usize, usize) {
+    let whole = look.fit && w * 9 <= h * 16;
+    zoomed(if whole { (w, h) } else { crop_16_9(w, h) }, look.zoom)
+}
+
 fn zoomed((w, h): (usize, usize), zoom: u32) -> (usize, usize) {
     if zoom <= 100 {
         return (w, h);
@@ -1041,7 +861,6 @@ fn zoomed((w, h): (usize, usize), zoom: u32) -> (usize, usize) {
     )
 }
 
-/// Flips a rendered frame left for right, upside down, or both, which is a half turn.
 fn turn(f: Format, frame: &mut [u8], mirror: bool, upside_down: bool) {
     let (w, h) = (f.width as usize, f.height as usize);
     if f.fourcc == YUY2 {
@@ -1074,7 +893,6 @@ fn turn(f: Format, frame: &mut [u8], mirror: bool, upside_down: bool) {
     }
 }
 
-/// Reverses the order of `rows` rows of `len` bytes.
 fn swap_rows(plane: &mut [u8], len: usize, rows: usize) {
     let (top, bottom) = plane.split_at_mut((len * rows.div_euclid(2)).min(plane.len()));
     let bottom = bottom.get_mut(..len * rows.div_ceil(2)).unwrap_or_default();
@@ -1083,7 +901,6 @@ fn swap_rows(plane: &mut [u8], len: usize, rows: usize) {
     }
 }
 
-/// The largest centred-width 16:9 region, with even sides for chroma.
 fn crop_16_9(w: usize, h: usize) -> (usize, usize) {
     let even = |v: usize| v & !1;
     if w * 9 <= h * 16 {
@@ -1106,7 +923,6 @@ fn rgb_to_bt709_limited() -> [[i32; 3]; 3] {
     to_bt709_limited([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
 }
 
-/// `to_rgb` takes the decoded pixel to full-range RGB.
 fn to_bt709_limited(to_rgb: [[f64; 3]; 3]) -> [[i32; 3]; 3] {
     let (kr, kb) = (0.2126, 0.0722);
     let kg = 1.0 - kr - kb;
@@ -1137,12 +953,10 @@ fn to_bt709_limited(to_rgb: [[f64; 3]; 3]) -> [[i32; 3]; 3] {
     m
 }
 
-/// Detail this small is left alone, so sharpening doesn't lift sensor grain that video calls
-/// then spend their bits on. On a synthetic room with ISO 3200 grain, sharpening at the default
-/// cost 8% more bits at a fixed quality, where 0.35 without this cost 31% for the same edges.
+/// Detail this small is left alone, so sharpening doesn't lift grain that calls spend bits on.
+/// With ISO 3200 grain the default costs 8% more bits, where 0.35 without it costs 31%.
 const CORE: i32 = 8;
 
-/// Unsharp mask against a 3x3 box blur. Edges are left as they are.
 fn sharpen(luma: &mut [u8], blur: &mut Vec<u8>, w: usize, h: usize, amount: f32) {
     if w < 3 || h < 3 {
         return;
@@ -1170,7 +984,6 @@ fn sharpen(luma: &mut [u8], blur: &mut Vec<u8>, w: usize, h: usize, amount: f32)
             let centre = i32::from(m1);
             let detail = centre - sum.div_euclid(9);
             let detail = detail - detail.clamp(-CORE, CORE);
-            // Detail can be negative, and checked_div truncates toward zero like `/` does.
             let boost = (detail * k).checked_div(256).unwrap_or_default();
             *o = (centre + boost).clamp(16, 235) as u8;
         }
@@ -1253,31 +1066,6 @@ mod tests {
         assert_eq!(p.size(), (528, 352));
     }
 
-    /// A frame of `f` where every byte differs from its neighbours.
-    fn numbered(f: Format) -> Vec<u8> {
-        (0..f.bytes())
-            .map(|i| (i * 7).rem_euclid(251) as u8)
-            .collect()
-    }
-
-    #[test]
-    fn turning_twice_puts_the_frame_back() {
-        for (width, height, fourcc) in [(8, 6, NV12), (8, 5, YUY2), (6, 4, NV12)] {
-            let f = Format {
-                width,
-                height,
-                fourcc,
-            };
-            for (mirror, upside_down) in [(true, false), (false, true), (true, true)] {
-                let mut frame = numbered(f);
-                turn(f, &mut frame, mirror, upside_down);
-                assert_ne!(frame, numbered(f), "{f:?} {mirror} {upside_down}");
-                turn(f, &mut frame, mirror, upside_down);
-                assert_eq!(frame, numbered(f), "{f:?} {mirror} {upside_down}");
-            }
-        }
-    }
-
     #[test]
     fn mirror_and_upside_down_move_pixels_where_they_belong() {
         let f = Format {
@@ -1285,10 +1073,9 @@ mod tests {
             height: 2,
             fourcc: NV12,
         };
-        let mut frame = numbered(f);
+        let mut frame: Vec<u8> = (0..f.bytes()).map(|i| i as u8).collect();
         let before = frame.clone();
         turn(f, &mut frame, true, true);
-        // A half turn: luma reversed, and the one chroma row's pairs reversed.
         let luma: Vec<u8> = before.iter().take(8).rev().copied().collect();
         assert_eq!(frame.get(..8).unwrap(), luma);
         assert_eq!(
@@ -1307,15 +1094,59 @@ mod tests {
     }
 
     #[test]
-    fn mid_grey_lands_on_video_range_grey() {
+    fn broken_frame_sizes_are_refused() {
+        let mut p = Pipeline::default();
+        let look = Look {
+            zoom: 150,
+            ..Look::default()
+        };
+        for (width, height) in [(64, 2), (8192, 8192)] {
+            let format = capture::Format::Raw {
+                pixels: capture::Pixels::Yuy2,
+                width,
+                height,
+                bt709: false,
+            };
+            assert!(
+                p.decode_frame(&[], format, look).is_err(),
+                "{width}x{height}"
+            );
+        }
         let out = Format {
             width: 1280,
             height: 720,
             fourcc: NV12,
         };
-        let nv12 = rendered([128, 128, 128], out);
-        near(at(&nv12, 1280 * 360 + 640), 126);
-        near(at(&nv12, 1280 * 720 + 1280 * 180 + 640), 128);
+        assert!(p.render(out, &mut vec![0; out.bytes()]).is_err());
+    }
+
+    #[test]
+    fn wide_pictures_crop_instead_of_squashing() {
+        let look = Look {
+            fit: true,
+            zoom: 100,
+            ..Look::default()
+        };
+        assert_eq!(crop_size((2560, 1080), look), (1920, 1080));
+        assert_eq!(crop_size((1056, 704), look), (1056, 704));
+    }
+
+    #[test]
+    fn a_short_frame_keeps_the_last_good_one() {
+        let mut p = Pipeline::default();
+        let look = Look::default();
+        let raw = |width, height| capture::Format::Raw {
+            pixels: capture::Pixels::Yuy2,
+            width,
+            height,
+            bt709: false,
+        };
+        p.decode_frame(&[81, 90, 81, 240].repeat(8 * 16), raw(16, 16), look)
+            .unwrap();
+        let good = p.frame().0.to_vec();
+        assert!(p.decode_frame(&[0; 64], raw(32, 32), look).is_err());
+        let (pixels, width, _) = p.frame();
+        assert_eq!((pixels, width), (good.as_slice(), 16));
     }
 
     #[test]
@@ -1355,21 +1186,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn pure_red_matches_bt709_limited() {
-        // BT.709 limited red is Y 63, Cb 102, Cr 240.
-        let out = Format {
-            width: 1920,
-            height: 1080,
-            fourcc: NV12,
-        };
-        let nv12 = rendered([255, 0, 0], out);
-        let uv = 1920 * 1080 + 1920 * 270 + 960;
-        near(at(&nv12, 1920 * 540 + 960), 63);
-        near(at(&nv12, uv), 102);
-        near(at(&nv12, uv + 1), 240);
-    }
-
+    /// BT.709 limited red is Y 63, Cb 102, Cr 240.
     #[test]
     fn yuy2_interleaves_luma_and_chroma() {
         let out = Format {
@@ -1385,9 +1202,8 @@ mod tests {
         near(at(&yuy2, px + 3), 240);
     }
 
-    /// Runs only with `VIEWFINDER_VFX` pointing at NVIDIA's DLLs.
     #[test]
-    fn gpu_path_matches_colours_and_timing() {
+    fn gpu_path_matches_colours() {
         let Some(dir) = std::env::var_os("VIEWFINDER_VFX").map(PathBuf::from) else {
             return;
         };
@@ -1402,7 +1218,6 @@ mod tests {
             vsr_quality: 0,
             ..Look::default()
         };
-        // Quality 0 takes the CPU path, so force bicubic through the GPU to check colours.
         p.decode(
             &jpeg_of(1056, 704, [255, 0, 0]),
             Look {
@@ -1425,16 +1240,8 @@ mod tests {
             .unwrap();
         p.decode(&jpeg, Look::default()).unwrap();
         p.render(out, &mut dst).unwrap();
-        let start = Instant::now();
-        for _ in 0..30 {
-            p.decode(&jpeg, Look::default()).unwrap();
-            p.render(out, &mut dst).unwrap();
-        }
-        let ms = start.elapsed().as_secs_f64() * 1000.0 / 30.0;
-        println!("decode + 1080p super resolution: {ms:.1} ms");
         assert!(p.gpu_problem().is_none());
 
-        // 640x360 scales the picture down, which the GPU path has to handle too.
         for (w, h) in [(1280, 720), (640, 360)] {
             let f = Format {
                 width: w,
@@ -1452,8 +1259,6 @@ mod tests {
             );
         }
 
-        // The most zoom there is, filled to 16:9, is the biggest upscale and still goes through
-        // super resolution, turned over.
         let look = Look {
             fit: false,
             zoom: 200,
@@ -1467,7 +1272,6 @@ mod tests {
         assert!(p.gpu_problem().is_none(), "zoomed: {:?}", p.gpu_problem());
     }
 
-    /// `preview_output` one byte at a time, as a reference.
     fn preview_by_pixel(f: Format, frame: &[u8]) -> Vec<u8> {
         let (w, h) = (f.width as usize, f.height as usize);
         let step = if w > 1280 { 2 } else { 1 };
@@ -1559,7 +1363,6 @@ mod tests {
         }
     }
 
-    /// A 1056x704 RGB picture with detail everywhere, so the JPEG isn't trivially small.
     fn test_pattern() -> Vec<u8> {
         (0..1056 * 704)
             .flat_map(|i: usize| {

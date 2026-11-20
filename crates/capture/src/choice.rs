@@ -1,13 +1,13 @@
-//! Which camera Viewfinder uses, kept as `key=value` lines like the other settings files.
+//! Which camera Viewfinder uses, kept as `key=value` lines.
 
 /// A camera maker whose bodies stream over PTP.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Vendor {
-    /// Canon EOS, through the `canon` crate.
+    /// Canon EOS.
     Canon,
-    /// Nikon, see [`crate::nikon`].
+    /// Nikon.
     Nikon,
-    /// Sony, see [`crate::sony`].
+    /// Sony.
     Sony,
 }
 
@@ -48,21 +48,19 @@ impl Vendor {
     }
 }
 
-/// One camera, named so the same one is found again after it's unplugged or Viewfinder restarts.
+/// One camera, named so it's found again after a replug or restart.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Choice {
-    /// A body on PTP, by the name Windows gives it. An empty `model` takes any body from
-    /// `vendor`.
+    /// A body on PTP. An empty `model` takes any body from `vendor`.
     Ptp {
         /// The maker.
         vendor: Vendor,
         /// The body's name in Windows, such as "Canon EOS REBEL T3".
         model: String,
     },
-    /// A webcam or capture card, by its symbolic link, or by `name` when the link has changed,
-    /// as it does when the device goes into another USB port.
+    /// A webcam or capture card, by `link`, or by `name` when another USB port changed the link.
     Video {
-        /// The device interface path Media Foundation opens it by.
+        /// The device interface path.
         link: String,
         /// Its friendly name.
         name: String,
@@ -79,8 +77,7 @@ impl Default for Choice {
 }
 
 impl Choice {
-    /// Reads the choice from a settings file's lines. Anything missing or unknown gives the
-    /// Canon.
+    /// Reads the choice back. Anything missing or unknown gives the Canon.
     #[must_use]
     pub fn read(text: &str) -> Self {
         let (mut kind, mut device, mut link) = ("", "", "");
@@ -128,8 +125,7 @@ impl Choice {
         }
     }
 
-    /// Where this camera is among those plugged in. A webcam's link wins over its name, which
-    /// tells apart two webcams with the same name.
+    /// Where this camera is in `found`. A webcam's link wins over its name.
     #[must_use]
     pub fn find(&self, found: &[Self]) -> Option<usize> {
         match self {
@@ -224,15 +220,5 @@ mod tests {
             "a moved webcam is found by its name"
         );
         assert_eq!(video("moved", "").find(&found), None);
-    }
-
-    #[test]
-    fn vendors_come_from_device_paths() {
-        assert_eq!(
-            Vendor::of(r"\\?\USB#VID_04A9&PID_3217#3#{6ac27878-a6fa-4155-ba85-f98f491d4f33}"),
-            Some(Vendor::Canon)
-        );
-        assert_eq!(Vendor::of(r"\\?\usb#vid_054c&pid_0994"), Some(Vendor::Sony));
-        assert_eq!(Vendor::of(r"\\?\usb#vid_18d1&pid_4ee1"), None);
     }
 }

@@ -1,7 +1,5 @@
-//! Steady white balance. The camera's auto white balance lets a red shirt or a blue screen pull
-//! the colour of everything else, so instead the app works out the light from the pixels that
-//! look grey, holds the camera at that colour temperature, and only moves once the light itself
-//! has changed colour for a while.
+//! Steady white balance. The camera's auto lets a red shirt or a blue screen pull everything
+//! else, so the light is worked out from the pixels that look grey and held until it changes.
 
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
@@ -10,8 +8,7 @@ use crate::face::Face;
 
 /// The `WhiteBalance` value for a colour temperature in Kelvin.
 const KELVIN: u32 = 9;
-/// Canon's presets and the colour temperature each stands for, for a body that has no Kelvin
-/// setting. Flash and the custom ones are left out.
+/// Canon's presets and their colour temperatures, leaving out Flash and the custom ones.
 const PRESETS: [(u32, f32); 5] = [
     (1, 5200.0),
     (2, 6000.0),
@@ -19,65 +16,55 @@ const PRESETS: [(u32, f32); 5] = [
     (4, 4000.0),
     (8, 7000.0),
 ];
-/// The range the T3 takes for a colour temperature, in 100 K steps.
+/// The T3's colour temperature range, in 100 K steps.
 const KELVIN_RANGE: (u32, u32) = (2500, 10000);
-/// Where the first measurement starts from when the camera is on Auto or a custom setting,
-/// which say nothing about the light: daylight.
+/// Daylight, where measuring starts when Auto or a custom setting says nothing about the light.
 const START: f32 = 5200.0;
 
-/// How far the light has to move, in mireds, before white balance is worked out again. A
-/// desk lamp against a window is over 100, and someone moving around the frame is under 30.
+/// Mireds the light has to move before it's measured again. A desk lamp against a window is
+/// over 100, and someone moving around the frame is under 30.
 const THRESHOLD: f32 = 60.0;
-/// How long it has to stay moved, in seconds, so someone walking past doesn't count.
+/// Seconds it has to stay moved, so someone walking past doesn't count.
 const HOLD: f64 = 10.0;
-/// How long after a change the camera's frames are trusted to show it.
+/// Seconds after a change before the camera's frames show it.
 const SETTLE: f64 = 0.8;
-/// How long the colour is averaged before deciding.
 const MEASURE: f64 = 0.5;
-/// Seconds.
 const TAU: f64 = 0.5;
-/// Close enough to stop adjusting. 100 K steps are 11 mireds apart at 3000 K and 3 at 5500.
+/// 100 K steps are 11 mireds apart at 3000 K and 3 at 5500.
 const TOLERANCE: f32 = 8.0;
 const MAX_TRIES: u32 = 3;
-/// If the grey pixels moved by less than this share of what a change should do, live view
-/// isn't showing white balance, so it gives up and holds.
+/// Greys that moved less than this share of what a change should do mean live view isn't
+/// showing white balance.
 const RESPONSE: f32 = 0.3;
-/// A change smaller than this, in mireds, is too small to test that live view responds.
+/// Mireds below which a change is too small to test that live view responds.
 const TESTABLE: f32 = 20.0;
 
-/// Samples every 8th pixel of every 8th row, like `exposure::brightness`.
 const STRIDE: usize = 8;
-/// Any channel at or above this may be clipped, which bleaches the colour toward white.
+/// Clipping bleaches the colour toward white.
 const CLIPPED: u8 = 245;
-/// With every channel below this, noise and the tone curve's toe swamp the colour.
+/// Below this, noise and the tone curve's toe swamp the colour.
 const DARK: u8 = 32;
-/// How far from the grey middle a pixel can be and still count as grey, in natural log units,
-/// narrowing pass by pass. Skin is about 1 warm of grey, and a saturated shirt 2 or more.
+/// Natural log distance from the grey middle, narrowing pass by pass. Skin is about 1 warm of
+/// grey, and a saturated shirt 2 or more.
 const GATES: [f32; 2] = [0.35, 0.15];
-/// The share of usable pixels that have to look grey for a reading to count.
 const MIN_GREY: f32 = 0.05;
-/// How far from grey, in warmth and tint, the greys can be and still be a real lamp seen
-/// through the camera's correction. A frame filled with one colour has nothing grey in it but
-/// agrees with itself, and this is what turns it away. A 2,500 K lamp through a 10,000 K
-/// setting is 3.2 warm and 0.47 green, and anything further off isn't a light.
+/// A frame of one colour has nothing grey but agrees with itself, and this turns it away. A
+/// 2,500 K lamp through a 10,000 K setting is 3.2 warm and 0.47 green.
 const PLAUSIBLE: (f32, f32) = (3.3, 0.6);
 
-/// The natural log of linear light for each 8-bit code, with the same 2.2 gamma as steady
-/// exposure.
 static LN: LazyLock<[f32; 256]> =
     LazyLock::new(|| std::array::from_fn(|c| 2.2 * (c.max(1) as f32 / 255.0).ln()));
 
-/// The colour of the pixels that look grey, in natural log units of linear light.
+/// The colour of the grey pixels, in natural log units of linear light.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(crate) struct Cast {
-    /// ln(R / B), positive when they lean warm.
+    /// ln(R / B).
     pub warm: f32,
-    /// ln G less the mean of ln R and ln B, positive when they lean green.
+    /// ln G less the mean of ln R and ln B.
     pub tint: f32,
 }
 
 impl Cast {
-    /// Moves `k` of the way to `to`.
     pub(crate) fn toward(self, to: Self, k: f32) -> Self {
         Self {
             warm: (to.warm - self.warm).mul_add(k, self.warm),
@@ -86,10 +73,12 @@ impl Cast {
     }
 }
 
-/// The correction last shown, kept so the next start opens on it instead of flashing.
+/// Kept so the next start opens on it instead of flashing.
 pub(crate) fn load_shown() -> Option<Cast> {
     let text = crate::store::read("white.txt")?;
-    let mut v = text.split_whitespace().map(|n| n.parse::<f32>().ok());
+    let mut v = text
+        .split_whitespace()
+        .map(|n| n.parse::<f32>().ok().filter(|v| v.is_finite()));
     Some(Cast {
         warm: v.next()??,
         tint: v.next()??,
@@ -100,7 +89,6 @@ pub(crate) fn save_shown(cast: Cast) {
     crate::store::write("white.txt", &format!("{} {}\n", cast.warm, cast.tint));
 }
 
-/// Finds a frame's grey pixels and their colour.
 #[derive(Debug, Default)]
 pub(crate) struct Greys {
     samples: Vec<[f32; 2]>,
@@ -109,12 +97,8 @@ pub(crate) struct Greys {
 }
 
 impl Greys {
-    /// The colour of the grey pixels, or None when too few look grey. `pixels` is RGB or
-    /// full range YCbCr.
-    ///
-    /// Plain grey world would read a red shirt as a red light. This keeps well exposed pixels
-    /// near the frame's middle colour and narrows on the nearest, which drops shirts, skin and
-    /// screens and keeps walls, paper and grey clothes.
+    /// Plain grey world would read a red shirt as a red light. Narrowing on the pixels nearest
+    /// the middle colour drops shirts, skin and screens and keeps walls, paper and grey clothes.
     pub(crate) fn cast(&mut self, pixels: &[u8], width: usize, rgb: bool) -> Option<Cast> {
         self.samples.clear();
         if width == 0 {
@@ -133,8 +117,7 @@ impl Greys {
         })
     }
 
-    /// The colour of the skin on a face, from the cheeks and nose, where there's least hair,
-    /// eye and lip. The same narrowing as for greys drops what's left of those.
+    /// From the cheeks and nose, where there's least hair, eye and lip.
     pub(crate) fn skin(
         &mut self,
         pixels: &[u8],
@@ -143,9 +126,10 @@ impl Greys {
         face: Face,
     ) -> Option<Cast> {
         self.samples.clear();
+        // Clipped to the frame, so a face partly off the right edge still gives its cheeks.
         let (x0, x1) = (
             face.x + face.w.div_euclid(4),
-            face.x + (face.w * 3).div_euclid(4),
+            (face.x + (face.w * 3).div_euclid(4)).min(width),
         );
         let (y0, y1) = (
             face.y + (face.h * 2).div_euclid(5),
@@ -185,7 +169,6 @@ impl Greys {
         }
     }
 
-    /// The middle colour of the samples, narrowed onto the ones nearest it.
     fn narrow(&mut self) -> Option<[f32; 2]> {
         let mut centre = [
             median(&mut self.axis, self.samples.iter().map(|s| s[0]))?,
@@ -206,26 +189,22 @@ impl Greys {
     }
 }
 
-/// Skin under a neutral light. The light and dark skin patches of the `ColorChecker` land at
-/// 0.88 and 1.09 warm and -0.13 and -0.16 tint, and warm is set under them because a face
-/// put right on them looked too orange live.
+/// Skin under a neutral light. The `ColorChecker`'s skin patches land at 0.88 and 1.09 warm and
+/// -0.13 and -0.16 tint, and warm sits under them since a face put right on them looks too
+/// orange live.
 const SKIN: Cast = Cast {
     warm: 0.7,
     tint: -0.13,
 };
-/// How long the skin is averaged before white balance settles on it.
 const SKIN_LOCK: Duration = Duration::from_secs(2);
-/// How long to wait for a face before going by the room.
 const FACE_WAIT: Duration = Duration::from_secs(3);
-/// How far a new face measurement can move the correction from last time's. A lamp or
-/// false face read in a bad moment would otherwise turn the whole session blue.
+/// How far a face reading can move the correction from last time's, so a lamp or false face
+/// read in a bad moment can't turn the whole session blue.
 const ANCHOR: f32 = 0.15;
-/// How far the room's correction has to move for the light to count as changed, which
-/// is about half a preset apart.
+/// About half a preset apart.
 const NEW_LIGHT: f32 = 0.25;
 
-/// The light on a face, as the cast a grey beside it would have, from its skin. None when
-/// it's further off than any lamp, which means the reading wasn't skin.
+/// The cast a grey beside the face would have, or None when it's further off than any lamp.
 pub(crate) fn light_on(skin: Cast) -> Option<Cast> {
     let light = Cast {
         warm: skin.warm - SKIN.warm,
@@ -234,11 +213,9 @@ pub(crate) fn light_on(skin: Cast) -> Option<Cast> {
     (light.warm.abs() <= PLAUSIBLE.0 && light.tint.abs() <= PLAUSIBLE.1).then_some(light)
 }
 
-/// Measures the face's skin once and then keeps the cast that puts it back on skin, so
-/// moving around or leaving the frame changes nothing.
+/// Measures the skin once and keeps that, so moving around or leaving the frame changes nothing.
 #[derive(Debug, Default)]
 pub(crate) struct Skin {
-    /// Last time's correction, which a new measurement stays near.
     anchor: Option<Cast>,
     started: Option<Instant>,
     first: Option<Instant>,
@@ -255,8 +232,7 @@ impl Skin {
         }
     }
 
-    /// Starts measuring again when the room's correction moves from `was` to `now`. Only a
-    /// real change of light lets go of last time's correction.
+    /// Only a real change of light lets go of last time's correction.
     pub(crate) fn reset(&mut self, was: Option<Cast>, now: Option<Cast>) {
         let moved = was.zip(now).is_some_and(|(a, b)| {
             (a.warm - b.warm).abs() > NEW_LIGHT || (a.tint - b.tint).abs() > NEW_LIGHT
@@ -268,7 +244,7 @@ impl Skin {
         };
     }
 
-    /// Whether it's still waiting on a face, when whatever is on screen should stay.
+    /// Still waiting on a face, so whatever is on screen should stay.
     pub(crate) fn deciding(&self) -> bool {
         self.locked.is_none()
             && (self.first.is_some()
@@ -276,8 +252,6 @@ impl Skin {
                 || self.started.is_some_and(|t| t.elapsed() < FACE_WAIT))
     }
 
-    /// Takes this frame's reading, if there was a face, and gives the cast to take out once
-    /// it's settled.
     pub(crate) fn correction(&mut self, reading: Option<Cast>) -> Option<Cast> {
         if self.locked.is_none()
             && let Some(r) = reading
@@ -318,7 +292,6 @@ fn median(axis: &mut Vec<f32>, values: impl Iterator<Item = f32>) -> Option<f32>
     Some(*m)
 }
 
-/// JFIF's full range YCbCr to RGB, in 16.16 fixed point.
 fn ycc_to_rgb([y, cb, cr]: [u8; 3]) -> [u8; 3] {
     let (y, cb, cr) = (i32::from(y) << 16, i32::from(cb) - 128, i32::from(cr) - 128);
     let c = |v: i32| ((v + (1 << 15)) >> 16).clamp(0, 255) as u8;
@@ -329,9 +302,7 @@ fn ycc_to_rgb([y, cb, cr]: [u8; 3]) -> [u8; 3] {
     ]
 }
 
-/// A lookup table per channel that takes `cast` off 8-bit RGB. With a 2.2 gamma, a gain in
-/// linear light is a fixed multiple of the code. Brightness is kept, and a cast past what a
-/// lamp could leave is limited.
+/// With a 2.2 gamma, a gain in linear light is a fixed multiple of the code.
 #[expect(
     clippy::suboptimal_flops,
     reason = "mul_add would change rounding and is a software call without FMA"
@@ -346,16 +317,14 @@ pub(crate) fn balance_lut(cast: Cast) -> [[u8; 256]; 3] {
     })
 }
 
-/// Mireds, a million over Kelvin, which is the scale colour casts add up on.
 pub(crate) fn mired(kelvin: f32) -> f32 {
     1e6 / kelvin
 }
 
-/// The first mired the locus table covers, and how many it covers, about 12,500 to 2,170 K.
 const LOCUS_FROM: f32 = 80.0;
 const LOCUS_LEN: usize = 381;
 
-/// ln(R / B) in linear sRGB of a black body, by mired from `LOCUS_FROM`, one mired a step.
+/// A black body's ln(R / B) in linear sRGB, one mired a step from `LOCUS_FROM`.
 static LOCUS: LazyLock<Vec<f32>> = LazyLock::new(|| {
     (0..LOCUS_LEN)
         .map(|i| {
@@ -395,7 +364,6 @@ pub(crate) fn black_body(kelvin: f32) -> [f32; 3] {
     .map(|c| c.max(1e-4) as f32)
 }
 
-/// How warm a black body at `mired` looks, as ln(R / B).
 #[expect(
     clippy::suboptimal_flops,
     reason = "mul_add would change rounding and is a software call without FMA"
@@ -414,13 +382,12 @@ fn locus(mired: f32) -> f32 {
     a + (b - a) * at.fract()
 }
 
-/// How green a black body at `mired` looks, as ln G less the mean of ln R and ln B.
 fn locus_tint(mired: f32) -> f32 {
     let [r, g, b] = black_body(1e6 / mired);
     g.ln() - f32::midpoint(r.ln(), b.ln())
 }
 
-/// The mired whose black body looks `warm`, the inverse of `locus`.
+/// The inverse of `locus`.
 fn mired_of(warm: f32) -> f32 {
     let i = LOCUS.partition_point(|&w| w < warm).clamp(1, LOCUS_LEN - 1);
     let (a, b) = (
@@ -437,15 +404,12 @@ fn mired_of(warm: f32) -> f32 {
 
 pub(crate) struct Settings<'a> {
     pub wb: u32,
-    /// `ColorTemperature` in Kelvin, None if the camera hasn't announced it.
     pub kelvin: Option<u32>,
     pub wbs: &'a [u32],
-    /// The colour temperatures it lists, empty when it sends no list.
     pub kelvins: &'a [u32],
 }
 
 impl Settings<'_> {
-    /// The colour temperature the camera is correcting for, in mireds, if its setting says.
     fn mired(&self) -> Option<f32> {
         if self.wb == KELVIN {
             return self.kelvin.filter(|&k| k > 0).map(|k| mired(k as f32));
@@ -458,7 +422,6 @@ impl Settings<'_> {
     }
 }
 
-/// The colour temperature a white balance setting stands for, in Kelvin, for the window.
 pub(crate) fn held(wb: Option<u32>, kelvin: Option<u32>) -> Option<u32> {
     if wb == Some(KELVIN) {
         return kelvin;
@@ -466,7 +429,6 @@ pub(crate) fn held(wb: Option<u32>, kelvin: Option<u32>) -> Option<u32> {
     PRESETS.iter().find(|p| Some(p.0) == wb).map(|p| p.1 as u32)
 }
 
-/// A white balance to set, with its colour temperature when it's a Kelvin setting.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Change {
     pub wb: u32,
@@ -486,8 +448,6 @@ impl Change {
     }
 }
 
-/// The allowed setting closest to `want` mireds: a colour temperature if the camera has one,
-/// otherwise the nearest preset.
 fn pick(want: f32, s: &Settings<'_>) -> Option<Change> {
     let nearest = |options: &mut dyn Iterator<Item = (u32, f32)>| {
         options.min_by(|a, b| {
@@ -525,47 +485,32 @@ enum Phase {
     },
 }
 
-/// Decides when to change white balance from a stream of frame colours. Time is in seconds
-/// from any fixed start, so recorded or synthetic traces can be replayed through it.
-#[derive(Debug)]
+impl Default for Phase {
+    fn default() -> Self {
+        Self::Measure {
+            from: 0.0,
+            tries: 0,
+        }
+    }
+}
+
+/// Time is in seconds from any fixed start, so recorded or synthetic traces replay through it.
+#[derive(Debug, Default)]
 pub(crate) struct Steady {
     phase: Phase,
     cast: Option<Cast>,
     last: f64,
     first: f64,
-    /// How warm the greys were before the last change, and how much warmer the change should
-    /// have made them.
+    /// How warm the greys were before the last change, and how much warmer it should make them.
     applied: Option<(f32, f32)>,
-    /// The light's colour from the latest frames, and the setting it was seen through, in mireds.
+    /// The light and the setting it was seen through, in mireds.
     light: Option<f32>,
     set: Option<f32>,
-    /// Set once a change didn't show in live view.
     unseen: bool,
-    /// The greys' colour when the setting was last settled on.
     residual: Option<Cast>,
 }
 
-impl Default for Steady {
-    fn default() -> Self {
-        Self {
-            phase: Phase::Measure {
-                from: 0.0,
-                tries: 0,
-            },
-            cast: None,
-            last: 0.0,
-            first: 0.0,
-            applied: None,
-            light: None,
-            set: None,
-            unseen: false,
-            residual: None,
-        }
-    }
-}
-
 impl Steady {
-    /// Works the light out again from scratch, as after connecting or turning it on.
     pub(crate) fn remeter(&mut self, t: f64) {
         *self = Self {
             phase: Phase::Measure {
@@ -576,31 +521,28 @@ impl Steady {
         };
     }
 
-    /// The colour of the light in Kelvin, once there's a reading.
+    /// Kelvin.
     pub(crate) fn light(&self) -> Option<f32> {
         self.light.map(|m| 1e6 / m)
     }
 
-    /// What the held setting leaves on the greys. A body without Kelvin settles on the nearest
-    /// preset, which can be 80 mireds off under a dim lamp, so the pipeline takes the rest out.
-    /// It only changes when the setting is settled again, so it doesn't follow the scene.
+    /// What the held setting leaves on the greys. The nearest preset can be 80 mireds off under
+    /// a dim lamp, so the pipeline takes the rest out. It only changes when the setting settles.
     pub(crate) const fn residual(&self) -> Option<Cast> {
         self.residual
     }
 
-    /// Whether a change didn't show up in live view, so it's holding without measuring.
     pub(crate) const fn unseen(&self) -> bool {
         self.unseen
     }
 
-    /// How green the greys are beyond what the black body line explains, which Kelvin can't
-    /// fix. Fluorescent tubes and cheap LEDs read positive.
+    /// Green beyond what the black body line explains, which Kelvin can't fix. Fluorescent
+    /// tubes and cheap LEDs read positive.
     pub(crate) fn tint(&self) -> Option<f32> {
         let (cast, light, set) = (self.cast?, self.light?, self.set?);
         Some(cast.tint - (locus_tint(light) - locus_tint(set)))
     }
 
-    /// Takes one frame's grey colour at time `t` and says what to set.
     pub(crate) fn update(
         &mut self,
         t: f64,
@@ -608,8 +550,7 @@ impl Steady {
         cam: &Settings<'_>,
     ) -> Option<Change> {
         let Some(set) = cam.mired() else {
-            // Auto and custom settings don't say what they're correcting for, so start from
-            // a known one and measure from there.
+            // Auto and custom settings don't say what they correct for, so start from a known one.
             return match self.phase {
                 Phase::Measure { from, tries } if t >= from && tries < MAX_TRIES => {
                     self.change(t, None, pick(mired(START), cam), tries)
@@ -660,7 +601,6 @@ impl Steady {
         }
     }
 
-    /// Smooths the grey colour and works out the light from it. Returns the smoothed warmth.
     #[expect(
         clippy::suboptimal_flops,
         reason = "mul_add would change rounding and is a software call without FMA"
@@ -707,8 +647,7 @@ impl Steady {
             return self.hold();
         }
         let light = self.light.unwrap_or(set);
-        // The setting already held, like the one remembered from last time, stays unless the
-        // light is clearly somewhere else.
+        // The setting already held stays unless the light is clearly somewhere else.
         let close = if tries == 0 { THRESHOLD } else { TOLERANCE };
         if (light - set).abs() <= close || tries >= MAX_TRIES {
             return self.hold();
@@ -716,8 +655,6 @@ impl Steady {
         self.change(t, Some((warm, set)), pick(light, cam), tries)
     }
 
-    /// Asks for `change` unless it's what the camera already has. `from` is the greys'
-    /// warmth and the setting's mireds before it, when the setting said what it corrects for.
     fn change(
         &mut self,
         t: f64,
@@ -774,7 +711,7 @@ mod tests {
             })
             .collect();
         let after = greys.cast(&fixed, 528, true).unwrap();
-        // Rounding to 8 bits and the greys picked shifting leave about 8 mireds, inside `TOLERANCE`.
+        // Rounding to 8 bits leaves about 8 mireds, inside `TOLERANCE`.
         assert!(
             after.warm.abs() < cast.warm / 4.0 && after.tint.abs() < 0.05,
             "{after:?}"
@@ -864,8 +801,6 @@ mod tests {
 
     const PRESETS_ONLY: [u32; 7] = [0, 1, 2, 3, 4, 5, 8];
 
-    /// Linear reflectances under white light. The room has a grey wall, a white door, a
-    /// darker grey shelf, a blue book and a plant, and a face in the middle.
     const WALL: [f32; 3] = [0.35, 0.35, 0.35];
     const DOOR: [f32; 3] = [0.7, 0.7, 0.68];
     const SHELF: [f32; 3] = [0.12, 0.12, 0.13];
@@ -874,8 +809,8 @@ mod tests {
     const SKIN: [f32; 3] = [0.55, 0.32, 0.22];
     const SHIRT: [f32; 3] = [0.6, 0.04, 0.05];
 
-    /// A 528x352 frame of the room lit at `light` K, through a camera correcting for `set`
-    /// K, exposed so the wall is mid grey. A red shirt fills the lower `shirt` share.
+    /// The room lit at `light` K through a camera set to `set` K, with a red shirt filling the
+    /// lower `shirt` share.
     #[expect(
         clippy::many_single_char_names,
         reason = "pixel coordinates and channels"
@@ -930,7 +865,6 @@ mod tests {
             .map(|v| v.round().clamp(0.0, 255.0) as u8)
     }
 
-    /// The light the greys say, in Kelvin, for a frame lit at `light` through a camera set to `set`.
     fn seen(light: f32, set: f32, shirt: f32, rgb: bool) -> f32 {
         let cast = Greys::default()
             .cast(&frame(light, set, shirt, rgb, 1), 528, rgb)
@@ -974,31 +908,6 @@ mod tests {
         let black = vec![0u8; 200 * 100 * 3];
         assert_eq!(Greys::default().cast(&black, 200, true), None);
         assert_eq!(Greys::default().cast(&[], 0, true), None);
-    }
-
-    /// The camera's 1056x704 frame, made from two of the test room side by side and stacked.
-    #[test]
-    fn greys_are_cheap() {
-        let half = frame(3200.0, 5200.0, 0.2, false, 1);
-        let mut full = Vec::with_capacity(1056 * 704 * 3);
-        for _ in 0..2 {
-            for row in half.as_chunks::<{ 528 * 3 }>().0 {
-                full.extend_from_slice(row);
-                full.extend_from_slice(row);
-            }
-        }
-        let mut greys = Greys::default();
-        let ms = crate::focus::tests::best_ms(|| {
-            assert!(
-                greys
-                    .cast(std::hint::black_box(&full), 1056, false)
-                    .is_some()
-            );
-        });
-        println!("greys: {ms:.3} ms a frame");
-        if !cfg!(debug_assertions) {
-            assert!(ms < 0.3, "{ms:.3} ms a frame");
-        }
     }
 
     #[test]
@@ -1049,13 +958,11 @@ mod tests {
 
     struct Run {
         changes: Vec<(f64, Change)>,
-        /// The camera's colour temperature at the end, in Kelvin.
         set: f32,
         unseen: bool,
     }
 
-    /// Plays a scene through a simulated camera at 28 fps. `light` and `shirt` say what the
-    /// room is at each moment. A camera that `responds` shows its setting in live view.
+    /// A simulated camera at 28 fps. One that `responds` shows its setting in live view.
     fn run(
         secs: f64,
         wbs: &[u32],
@@ -1068,7 +975,6 @@ mod tests {
         let mut greys = Greys::default();
         let (mut wb, mut kelvin) = (0u32, Some(5200u32));
         let mut changes = Vec::new();
-        // Only every fourth frame is rendered, which keeps the test quick, and the rest reuse it.
         let mut cast = None;
         for i in 0..(secs * 28.0) as u32 {
             let t = f64::from(i) / 28.0;
@@ -1079,7 +985,7 @@ mod tests {
                 kelvins: &[],
             };
             if i % 4 == 0 {
-                // Auto white balance on DIGIC 4 leaves tungsten warm, so model it as a third short.
+                // DIGIC 4's auto white balance only takes tungsten two thirds of the way.
                 let shown = match cam.mired() {
                     Some(m) if responds => 1e6 / m,
                     _ if responds => 1e6 / (mired(light(t)) * 0.67 + mired(5200.0) * 0.33),

@@ -1,8 +1,4 @@
-//! Every way Viewfinder gets live frames from a camera, behind one [`Source`] trait.
-//!
-//! Canon EOS bodies come through the `canon` crate, and Nikon and Sony bodies speak their own
-//! PTP live view over the same WPD driver. Any other video capture device comes through Media
-//! Foundation.
+//! Live frames from Canon, Nikon and Sony bodies over WPD, or any webcam through Media Foundation.
 
 mod canon;
 mod choice;
@@ -22,7 +18,7 @@ pub use wpd::{list, open, ptp_id};
 
 use windows::Win32::System::Com::{CO_MTA_USAGE_COOKIE, CoDecrementMTAUsage, CoIncrementMTAUsage};
 
-/// How a raw frame's pixels are laid out. Rows are packed, with no padding between them.
+/// A raw frame's pixel layout, with packed rows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Pixels {
     /// A full-size Y plane, then interleaved U and V at half size both ways.
@@ -34,8 +30,7 @@ pub enum Pixels {
 /// What kind of frame a [`Source`] put in the caller's buffer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Format {
-    /// A baseline JPEG, which carries its own size. A UVC MJPG frame may leave out its Huffman
-    /// tables, and the standard ones apply.
+    /// A baseline JPEG. A UVC MJPG frame may leave out its Huffman tables.
     Jpeg,
     /// Uncompressed limited-range YCbCr.
     Raw {
@@ -55,9 +50,9 @@ pub enum Format {
 pub enum Error {
     /// No camera this backend handles is plugged in and on.
     NotFound,
-    /// The camera went away. Drop the source and open it again.
+    /// The camera went away.
     Disconnected,
-    /// The camera is there but can't stream live view, and the reason says why.
+    /// The camera can't stream live view.
     Unsupported(String),
     /// The camera or Windows refused something.
     Failed(String),
@@ -84,24 +79,18 @@ pub trait Source: Send {
     fn model(&self) -> &str;
 
     /// Turns live view on. Safe to call when it already is.
-    ///
     /// # Errors
-    ///
     /// Fails when the camera refuses or is gone.
     fn start(&mut self) -> Result<()>;
 
-    /// Pulls the next frame into `out`, replacing what was there, or `None` if none is ready.
-    ///
+    /// Replaces `out` with the next frame, or returns `None` if none is ready.
     /// # Errors
-    ///
-    /// Fails when the camera is gone or answers with something other than not ready.
+    /// Fails when the camera is gone or refuses.
     fn frame(&mut self, out: &mut Vec<u8>) -> Result<Option<Format>>;
 
     /// Turns live view off and hands the camera back to its own controls.
-    ///
     /// # Errors
-    ///
-    /// Returns the first thing that went wrong, though every step is still tried.
+    /// Returns the first failure, though every step is still tried.
     fn close(self: Box<Self>) -> Result<()>;
 }
 
@@ -115,9 +104,7 @@ unsafe impl Send for Mta {}
 
 impl Mta {
     /// Joins the MTA for as long as the returned value lives.
-    ///
     /// # Errors
-    ///
     /// Fails when COM won't start.
     #[expect(unsafe_code, reason = "joining the MTA is a COM call")]
     pub fn enter() -> Result<Self> {

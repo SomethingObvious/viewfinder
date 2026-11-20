@@ -1,5 +1,4 @@
-//! PTP operations through the stock WPD driver's MTP extension commands, shared with the
-//! other PTP brands.
+//! PTP operations through the stock WPD driver's MTP extension, shared with other brands.
 
 use std::ffi::c_void;
 use std::ptr::null_mut;
@@ -32,13 +31,11 @@ use windows_core::{GUID, HSTRING, Interface, PCWSTR, PWSTR, Result};
 
 use crate::ptp::OP_GET_VIEWFINDER_DATA;
 
-/// Upper bound on one read chunk.
 const VIEWFINDER_READ: usize = 2 << 20;
-/// Nothing this crate reads comes near this, so a bigger announced size is a broken reply.
+/// Nothing real comes near this, so a bigger announced size is a broken reply.
 const MAX_READ: u64 = 32 << 20;
 const DEFAULT_CHUNK: u32 = 256 << 10;
 
-/// What a viewfinder pull produced.
 #[derive(Debug)]
 pub(crate) enum Pull {
     Data,
@@ -46,7 +43,7 @@ pub(crate) enum Pull {
     Code(u16),
 }
 
-/// One camera opened through WPD.
+/// A device opened through WPD.
 #[derive(Debug)]
 pub struct Wpd {
     pub(crate) device: IPortableDevice,
@@ -55,12 +52,11 @@ pub struct Wpd {
     landing: Vec<u8>,
 }
 
-/// Memory WPD allocated with `CoTaskMemAlloc`, freed on drop.
 #[derive(Debug)]
-pub(crate) struct CoTask(pub *mut c_void);
+struct CoTask(*mut c_void);
 
 impl CoTask {
-    pub(crate) const fn pcwstr(&self) -> PCWSTR {
+    const fn pcwstr(&self) -> PCWSTR {
         PCWSTR(self.0.cast())
     }
 }
@@ -76,16 +72,14 @@ impl Drop for CoTask {
 }
 
 #[expect(unsafe_code, reason = "creating a COM object is a Win32 call")]
-pub(crate) fn create<T: Interface>(clsid: &GUID) -> Result<T> {
+fn create<T: Interface>(clsid: &GUID) -> Result<T> {
     // SAFETY: `clsid` is a live GUID, and the class comes from WPD's own headers.
     unsafe { CoCreateInstance(clsid, None, CLSCTX_INPROC_SERVER) }
 }
 
 /// `PnP` ids of every device WPD can see.
-///
 /// # Errors
-///
-/// Fails when the WPD device manager won't start.
+/// When the WPD device manager won't start.
 #[expect(unsafe_code, reason = "the device manager is a COM object")]
 pub fn device_ids() -> Result<Vec<String>> {
     let manager: IPortableDeviceManager = create(&PortableDeviceManager)?;
@@ -113,10 +107,8 @@ pub fn device_ids() -> Result<Vec<String>> {
 }
 
 /// The name Windows shows for a WPD device, such as "Canon EOS REBEL T3".
-///
 /// # Errors
-///
-/// Fails when the device manager won't start or the device has gone.
+/// When the device manager won't start or the device has gone.
 #[expect(unsafe_code, reason = "the device manager is a COM object")]
 pub fn friendly_name(pnp_id: &str) -> Result<String> {
     let manager: IPortableDeviceManager = create(&PortableDeviceManager)?;
@@ -155,7 +147,7 @@ pub fn device_type(pnp_id: &str) -> Option<u32> {
 }
 
 #[expect(unsafe_code, reason = "the value store is a COM object")]
-pub(crate) fn client_info() -> Result<IPortableDeviceValues> {
+fn client_info() -> Result<IPortableDeviceValues> {
     let v: IPortableDeviceValues = create(&PortableDeviceValues)?;
     // SAFETY: the keys and the string are statics.
     unsafe {
@@ -169,7 +161,6 @@ pub(crate) fn client_info() -> Result<IPortableDeviceValues> {
 
 #[expect(unsafe_code, reason = "opening a device is a COM call")]
 fn open_device(pnp_id: &HSTRING, client: &IPortableDeviceValues) -> Result<IPortableDevice> {
-    // The free-threaded variant lets the device object be called from any MTA thread.
     let device: IPortableDevice = create(&PortableDeviceFTM)?;
     // SAFETY: both arguments are live.
     unsafe { device.Open(pnp_id, client)? };
@@ -177,7 +168,7 @@ fn open_device(pnp_id: &HSTRING, client: &IPortableDeviceValues) -> Result<IPort
 }
 
 #[expect(unsafe_code, reason = "the value store is a COM object")]
-pub(crate) fn command(cmd: &PROPERTYKEY) -> Result<IPortableDeviceValues> {
+fn command(cmd: &PROPERTYKEY) -> Result<IPortableDeviceValues> {
     let v: IPortableDeviceValues = create(&PortableDeviceValues)?;
     // SAFETY: the keys are statics and `cmd` outlives the calls.
     unsafe {
@@ -200,11 +191,7 @@ fn ui4(value: u32) -> PROPVARIANT {
 }
 
 #[expect(unsafe_code, reason = "the value stores are COM objects")]
-pub(crate) fn operation(
-    cmd: &PROPERTYKEY,
-    op: u16,
-    params: &[u32],
-) -> Result<IPortableDeviceValues> {
+fn operation(cmd: &PROPERTYKEY, op: u16, params: &[u32]) -> Result<IPortableDeviceValues> {
     let v = command(cmd)?;
     let list: IPortableDevicePropVariantCollection = create(&PortableDevicePropVariantCollection)?;
     for &p in params {
@@ -214,8 +201,7 @@ pub(crate) fn operation(
     // SAFETY: the keys are statics and the collection is live.
     unsafe {
         v.SetUnsignedIntegerValue(&WPD_PROPERTY_MTP_EXT_OPERATION_CODE, op.into())?;
-        // Vendor reads fail with 0x80070490 unless this collection is present, even empty
-        // (FC.SDK, "always include operation params").
+        // Vendor reads fail with 0x80070490 unless this collection is present, even empty.
         v.SetIPortableDevicePropVariantCollectionValue(
             &WPD_PROPERTY_MTP_EXT_OPERATION_PARAMS,
             &list,
@@ -224,12 +210,10 @@ pub(crate) fn operation(
     Ok(v)
 }
 
-/// The operation sent and not yet answered, with when it went in milliseconds since `EPOCH`
-/// in the high bits. 0 when nothing is waiting.
+/// The unanswered operation, with when it went in ms since `EPOCH` in the high bits.
 static FLIGHT: AtomicU64 = AtomicU64::new(0);
 static EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
 
-/// Marks an operation as waiting on the camera until it's dropped.
 struct Flight;
 
 impl Flight {
@@ -246,7 +230,7 @@ impl Drop for Flight {
     }
 }
 
-/// The operation a camera has been sent and hasn't answered yet, and how long it's waited.
+/// The operation the camera hasn't answered yet, and how long it's waited.
 #[must_use]
 pub fn waiting() -> Option<(u16, Duration)> {
     let flight = FLIGHT.load(Ordering::Relaxed);
@@ -278,7 +262,7 @@ fn response_code(results: &IPortableDeviceValues) -> Result<u16> {
 }
 
 #[expect(unsafe_code, reason = "the context comes back as a raw COM string")]
-pub(crate) fn context(results: &IPortableDeviceValues) -> Option<CoTask> {
+fn context(results: &IPortableDeviceValues) -> Option<CoTask> {
     // SAFETY: the key is a static.
     let s = unsafe { results.GetStringValue(&WPD_PROPERTY_MTP_EXT_TRANSFER_CONTEXT) }.ok()?;
     let ctx = CoTask(s.0.cast());
@@ -287,7 +271,7 @@ pub(crate) fn context(results: &IPortableDeviceValues) -> Option<CoTask> {
 }
 
 #[expect(unsafe_code, reason = "reading a result is a COM call")]
-pub(crate) fn total_size(results: &IPortableDeviceValues) -> u64 {
+fn total_size(results: &IPortableDeviceValues) -> u64 {
     let key = &WPD_PROPERTY_MTP_EXT_TRANSFER_TOTAL_DATA_SIZE;
     // SAFETY: the key is a static.
     unsafe { results.GetUnsignedLargeIntegerValue(key) }
@@ -303,7 +287,6 @@ fn landing(buf: &mut Vec<u8>, want: usize) -> &[u8] {
     buf.get(..want).unwrap_or_default()
 }
 
-/// One `READ_DATA` call, appending what arrived to `out`.
 #[expect(unsafe_code, reason = "the data comes back in a raw COM buffer")]
 fn read_chunk(
     device: &IPortableDevice,
@@ -319,8 +302,7 @@ fn read_chunk(
             &WPD_PROPERTY_MTP_EXT_TRANSFER_NUM_BYTES_TO_READ,
             landing.len() as u32,
         )?;
-        // Documented as a result only, but the driver fails even small reads unless the caller
-        // passes a landing buffer in (FC.SDK WpdPtpTransport.ReadChunk).
+        // Documented as a result only, but the driver fails even small reads without it.
         cmd.SetBufferValue(&WPD_PROPERTY_MTP_EXT_TRANSFER_DATA, landing)?;
     }
     let results = send(device, &cmd)?;
@@ -359,11 +341,9 @@ fn read_chunk(
 unsafe impl Send for Wpd {}
 
 impl Wpd {
-    /// Opens the device with this `PnP` id. The calling thread has to be in the MTA.
-    ///
+    /// Opens the device with this `PnP` id from an MTA thread.
     /// # Errors
-    ///
-    /// Fails when the device is gone or another app holds it.
+    /// When the device is gone or another app holds it.
     pub fn open(pnp_id: &str) -> Result<Self> {
         let pnp_id = HSTRING::from(pnp_id);
         let client = client_info()?;
@@ -376,11 +356,9 @@ impl Wpd {
         })
     }
 
-    /// An operation with no data phase. Returns the PTP response code.
-    ///
+    /// An operation with no data phase, returning the PTP response code.
     /// # Errors
-    ///
-    /// Fails when the operation never reached the camera.
+    /// When the operation never reached the camera.
     pub fn call(&self, op: u16, params: &[u32]) -> Result<u16> {
         let _flight = Flight::start(op);
         let cmd = operation(
@@ -391,11 +369,9 @@ impl Wpd {
         response_code(&send(&self.device, &cmd)?)
     }
 
-    /// An operation that reads data into `out`. Returns the PTP response code.
-    ///
+    /// An operation that reads into `out`, returning the PTP response code.
     /// # Errors
-    ///
-    /// Fails when the operation never reached the camera.
+    /// When the operation never reached the camera.
     #[expect(unsafe_code, reason = "reading a result is a COM call")]
     pub fn read(&mut self, op: u16, params: &[u32], out: &mut Vec<u8>) -> Result<u16> {
         let _flight = Flight::start(op);
@@ -430,18 +406,15 @@ impl Wpd {
             }
             Ok(())
         })();
-        // An unfinished transfer makes the device object refuse every later command, so the end
-        // phase runs even after a failed read (FC.SDK README).
+        // An unfinished transfer makes the device refuse every later command (FC.SDK README).
         let end = self.end(&ctx);
         body?;
         end
     }
 
-    /// An operation that sends `data` to the camera. Returns the PTP response code.
-    ///
+    /// An operation that sends `data`, returning the PTP response code.
     /// # Errors
-    ///
-    /// Fails when the operation never reached the camera.
+    /// When the operation never reached the camera.
     #[expect(unsafe_code, reason = "the value stores are COM objects")]
     pub fn write(&self, op: u16, params: &[u32], data: &[u8]) -> Result<u16> {
         let _flight = Flight::start(op);
@@ -487,12 +460,9 @@ impl Wpd {
         response_code(&send(&self.device, &cmd)?)
     }
 
-    /// Pulls one `GetViewFinderData` reply into `out`.
-    ///
-    /// On EOS bodies this read has no response phase, so `END_DATA_TRANSFER` never returns, and
-    /// skipping it poisons the device object. FC.SDK's fix, measured on a 450D, is a throwaway
-    /// device object per frame, read short and closed without the end phase
-    /// (docs/canon-windows-transports.md).
+    /// On EOS bodies this read has no response phase, so `END_DATA_TRANSFER` never returns and
+    /// skipping it poisons the device. FC.SDK's fix, measured on a 450D, is a throwaway device
+    /// per frame, read short and closed without the end phase.
     #[expect(unsafe_code, reason = "closing the device is a COM call")]
     pub(crate) fn viewfinder(&mut self, params: &[u32], out: &mut Vec<u8>) -> Result<Pull> {
         let _flight = Flight::start(OP_GET_VIEWFINDER_DATA);
@@ -515,9 +485,8 @@ impl Wpd {
             if total >= MAX_READ {
                 return Err(E_UNEXPECTED.into());
             }
-            // Asking for one byte more than was announced makes the read come back short,
-            // which tells the driver the data phase is over. A 2 MiB landing buffer like
-            // EDSDK's made pulls on the T3 about 4 ms slower.
+            // One byte more than announced makes the read come back short, which ends the data
+            // phase. A 2 MiB landing buffer like EDSDK's made T3 pulls about 4 ms slower.
             let want = total as usize + 1;
             read_chunk(&device, &ctx, landing(&mut self.landing, want), out)?;
             Ok(if out.is_empty() {

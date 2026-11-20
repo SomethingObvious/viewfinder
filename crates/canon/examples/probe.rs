@@ -1,7 +1,5 @@
-//! Opens the camera, prints its state, pulls live view for 10 s and reports what came back.
-//!
-//! Run with `cargo run -p canon --example probe --release -- --save <dir>`, where the save
-//! folder is optional.
+//! Prints the camera's state and times live view for `VIEWFINDER_SECS` (10 s).
+//! `cargo run -p canon --example probe --release -- [--save <dir>]`
 
 use std::collections::BTreeMap;
 use std::error::Error;
@@ -27,11 +25,9 @@ fn show(camera: &Camera, name: &str, prop: Prop, label: fn(u32) -> String) {
     );
 }
 
-/// One call in the timeline: when it started and how long it took in ms, whether it brought a
-/// frame, and the JPEG length.
+/// Start ms, duration ms, whether a frame came, JPEG length.
 type Call = (f64, f64, bool, usize);
 
-/// Counts and timings from the live view loop.
 struct Stats {
     frames: u32,
     not_ready: u32,
@@ -99,7 +95,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// The folder after `--save`, if there is one.
 fn save_dir() -> Result<Option<PathBuf>, Box<dyn Error>> {
     let mut args = std::env::args().skip(1);
     let mut save = None;
@@ -112,7 +107,6 @@ fn save_dir() -> Result<Option<PathBuf>, Box<dyn Error>> {
     Ok(save)
 }
 
-/// Mode, battery, exposure settings and the raw property values.
 fn print_state(camera: &Camera) {
     match camera.mode() {
         Some(m) if values::is_creative_mode(m) => println!("mode: {}", values::ae_mode_label(m)),
@@ -161,7 +155,6 @@ fn print_state(camera: &Camera) {
     }
 }
 
-/// Pulls live view for `VIEWFINDER_SECS` seconds, 10 by default.
 fn pull(camera: &mut Camera) -> Result<Stats, Box<dyn Error>> {
     let mut jpeg = Vec::new();
     let mut previous = Vec::new();

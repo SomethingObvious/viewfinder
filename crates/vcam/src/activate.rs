@@ -18,7 +18,6 @@ use crate::{Live, guard, lock};
 pub use object::Activator;
 use object::Activator_Impl;
 
-/// The activator on its own, since everything `#[implement]` generates lands beside it.
 #[expect(
     unsafe_code,
     trivial_casts,
@@ -35,8 +34,8 @@ mod object {
     use crate::Live;
     use crate::source::Source;
 
-    /// Creates the media source on demand and carries the attributes Frame
-    /// Server sets on it, which the source copies at creation.
+    /// Makes the media source and carries the attributes Frame Server sets, which the source
+    /// copies.
     #[derive(Debug)]
     #[implement(IMFActivate)]
     pub struct Activator {
@@ -48,10 +47,8 @@ mod object {
 
 impl Activator {
     /// Makes an activator with the attributes `VCamSample` sets.
-    ///
     /// # Errors
-    ///
-    /// Fails when Media Foundation can't make or fill the attribute store.
+    /// Fails when Media Foundation can't make the attribute store.
     #[expect(unsafe_code, reason = "setting attributes is a COM call")]
     pub fn new() -> Result<Self> {
         let attributes = new_attributes()?;
@@ -92,8 +89,7 @@ impl IMFActivate_Impl for Activator_Impl {
         })
     }
 
-    // Microsoft's own virtual camera sample and VCamSample both return S_OK
-    // here and leave shutting the source down to whoever holds it.
+    // Microsoft's sample and VCamSample both leave shutting down to whoever holds the source.
     fn ShutdownObject(&self) -> Result<()> {
         Ok(())
     }
@@ -106,8 +102,15 @@ impl IMFActivate_Impl for Activator_Impl {
     }
 }
 
-/// Calls an `IMFAttributes` method on the inner store straight through its
-/// vtable, for the methods whose safe wrappers reshape the arguments.
+macro_rules! fwd {
+    ($call:expr) => {
+        // SAFETY: forwards COM's arguments to the inner store untouched.
+        guard(|| unsafe { $call })
+    };
+}
+
+/// Calls the inner store through its vtable, for methods whose safe wrappers reshape the
+/// arguments.
 macro_rules! raw {
     ($store:expr, $method:ident $(, $arg:expr)*) => {
         // SAFETY: the vtable belongs to the live store, and the arguments are COM's, untouched.
@@ -125,13 +128,11 @@ impl IMFAttributes_Impl for Activator_Impl {
     }
 
     fn GetItemType(&self, key: *const GUID) -> Result<MF_ATTRIBUTE_TYPE> {
-        // SAFETY: forwards COM's arguments to the inner store untouched.
-        guard(|| unsafe { self.attributes.GetItemType(key) })
+        fwd!(self.attributes.GetItemType(key))
     }
 
     fn CompareItem(&self, key: *const GUID, value: *const PROPVARIANT) -> Result<BOOL> {
-        // SAFETY: forwards COM's arguments to the inner store untouched.
-        guard(|| unsafe { self.attributes.CompareItem(key, value) })
+        fwd!(self.attributes.CompareItem(key, value))
     }
 
     fn Compare(
@@ -139,33 +140,27 @@ impl IMFAttributes_Impl for Activator_Impl {
         theirs: Ref<'_, IMFAttributes>,
         kind: MF_ATTRIBUTES_MATCH_TYPE,
     ) -> Result<BOOL> {
-        // SAFETY: forwards COM's arguments to the inner store untouched.
-        guard(|| unsafe { self.attributes.Compare(theirs.as_ref(), kind) })
+        fwd!(self.attributes.Compare(theirs.as_ref(), kind))
     }
 
     fn GetUINT32(&self, key: *const GUID) -> Result<u32> {
-        // SAFETY: forwards COM's arguments to the inner store untouched.
-        guard(|| unsafe { self.attributes.GetUINT32(key) })
+        fwd!(self.attributes.GetUINT32(key))
     }
 
     fn GetUINT64(&self, key: *const GUID) -> Result<u64> {
-        // SAFETY: forwards COM's arguments to the inner store untouched.
-        guard(|| unsafe { self.attributes.GetUINT64(key) })
+        fwd!(self.attributes.GetUINT64(key))
     }
 
     fn GetDouble(&self, key: *const GUID) -> Result<f64> {
-        // SAFETY: forwards COM's arguments to the inner store untouched.
-        guard(|| unsafe { self.attributes.GetDouble(key) })
+        fwd!(self.attributes.GetDouble(key))
     }
 
     fn GetGUID(&self, key: *const GUID) -> Result<GUID> {
-        // SAFETY: forwards COM's arguments to the inner store untouched.
-        guard(|| unsafe { self.attributes.GetGUID(key) })
+        fwd!(self.attributes.GetGUID(key))
     }
 
     fn GetStringLength(&self, key: *const GUID) -> Result<u32> {
-        // SAFETY: forwards COM's arguments to the inner store untouched.
-        guard(|| unsafe { self.attributes.GetStringLength(key) })
+        fwd!(self.attributes.GetStringLength(key))
     }
 
     fn GetString(&self, key: *const GUID, buf: PWSTR, cch: u32, len: *mut u32) -> Result<()> {
@@ -173,13 +168,11 @@ impl IMFAttributes_Impl for Activator_Impl {
     }
 
     fn GetAllocatedString(&self, key: *const GUID, value: *mut PWSTR, len: *mut u32) -> Result<()> {
-        // SAFETY: forwards COM's arguments to the inner store untouched.
-        guard(|| unsafe { self.attributes.GetAllocatedString(key, value, len) })
+        fwd!(self.attributes.GetAllocatedString(key, value, len))
     }
 
     fn GetBlobSize(&self, key: *const GUID) -> Result<u32> {
-        // SAFETY: forwards COM's arguments to the inner store untouched.
-        guard(|| unsafe { self.attributes.GetBlobSize(key) })
+        fwd!(self.attributes.GetBlobSize(key))
     }
 
     fn GetBlob(&self, key: *const GUID, buf: *mut u8, size: u32, len: *mut u32) -> Result<()> {
@@ -187,8 +180,7 @@ impl IMFAttributes_Impl for Activator_Impl {
     }
 
     fn GetAllocatedBlob(&self, key: *const GUID, buf: *mut *mut u8, size: *mut u32) -> Result<()> {
-        // SAFETY: forwards COM's arguments to the inner store untouched.
-        guard(|| unsafe { self.attributes.GetAllocatedBlob(key, buf, size) })
+        fwd!(self.attributes.GetAllocatedBlob(key, buf, size))
     }
 
     fn GetUnknown(&self, key: *const GUID, riid: *const GUID, ppv: *mut *mut c_void) -> Result<()> {
@@ -196,43 +188,35 @@ impl IMFAttributes_Impl for Activator_Impl {
     }
 
     fn SetItem(&self, key: *const GUID, value: *const PROPVARIANT) -> Result<()> {
-        // SAFETY: forwards COM's arguments to the inner store untouched.
-        guard(|| unsafe { self.attributes.SetItem(key, value) })
+        fwd!(self.attributes.SetItem(key, value))
     }
 
     fn DeleteItem(&self, key: *const GUID) -> Result<()> {
-        // SAFETY: forwards COM's arguments to the inner store untouched.
-        guard(|| unsafe { self.attributes.DeleteItem(key) })
+        fwd!(self.attributes.DeleteItem(key))
     }
 
     fn DeleteAllItems(&self) -> Result<()> {
-        // SAFETY: forwards COM's arguments to the inner store untouched.
-        guard(|| unsafe { self.attributes.DeleteAllItems() })
+        fwd!(self.attributes.DeleteAllItems())
     }
 
     fn SetUINT32(&self, key: *const GUID, value: u32) -> Result<()> {
-        // SAFETY: forwards COM's arguments to the inner store untouched.
-        guard(|| unsafe { self.attributes.SetUINT32(key, value) })
+        fwd!(self.attributes.SetUINT32(key, value))
     }
 
     fn SetUINT64(&self, key: *const GUID, value: u64) -> Result<()> {
-        // SAFETY: forwards COM's arguments to the inner store untouched.
-        guard(|| unsafe { self.attributes.SetUINT64(key, value) })
+        fwd!(self.attributes.SetUINT64(key, value))
     }
 
     fn SetDouble(&self, key: *const GUID, value: f64) -> Result<()> {
-        // SAFETY: forwards COM's arguments to the inner store untouched.
-        guard(|| unsafe { self.attributes.SetDouble(key, value) })
+        fwd!(self.attributes.SetDouble(key, value))
     }
 
     fn SetGUID(&self, key: *const GUID, value: *const GUID) -> Result<()> {
-        // SAFETY: forwards COM's arguments to the inner store untouched.
-        guard(|| unsafe { self.attributes.SetGUID(key, value) })
+        fwd!(self.attributes.SetGUID(key, value))
     }
 
     fn SetString(&self, key: *const GUID, value: &PCWSTR) -> Result<()> {
-        // SAFETY: forwards COM's arguments to the inner store untouched.
-        guard(|| unsafe { self.attributes.SetString(key, *value) })
+        fwd!(self.attributes.SetString(key, *value))
     }
 
     fn SetBlob(&self, key: *const GUID, buf: *const u8, size: u32) -> Result<()> {
@@ -240,23 +224,19 @@ impl IMFAttributes_Impl for Activator_Impl {
     }
 
     fn SetUnknown(&self, key: *const GUID, value: Ref<'_, IUnknown>) -> Result<()> {
-        // SAFETY: forwards COM's arguments to the inner store untouched.
-        guard(|| unsafe { self.attributes.SetUnknown(key, value.as_ref()) })
+        fwd!(self.attributes.SetUnknown(key, value.as_ref()))
     }
 
     fn LockStore(&self) -> Result<()> {
-        // SAFETY: forwards COM's arguments to the inner store untouched.
-        guard(|| unsafe { self.attributes.LockStore() })
+        fwd!(self.attributes.LockStore())
     }
 
     fn UnlockStore(&self) -> Result<()> {
-        // SAFETY: forwards COM's arguments to the inner store untouched.
-        guard(|| unsafe { self.attributes.UnlockStore() })
+        fwd!(self.attributes.UnlockStore())
     }
 
     fn GetCount(&self) -> Result<u32> {
-        // SAFETY: forwards COM's arguments to the inner store untouched.
-        guard(|| unsafe { self.attributes.GetCount() })
+        fwd!(self.attributes.GetCount())
     }
 
     fn GetItemByIndex(&self, index: u32, key: *mut GUID, value: *mut PROPVARIANT) -> Result<()> {
@@ -264,7 +244,6 @@ impl IMFAttributes_Impl for Activator_Impl {
     }
 
     fn CopyAllItems(&self, dest: Ref<'_, IMFAttributes>) -> Result<()> {
-        // SAFETY: forwards COM's arguments to the inner store untouched.
-        guard(|| unsafe { self.attributes.CopyAllItems(dest.as_ref()) })
+        fwd!(self.attributes.CopyAllItems(dest.as_ref()))
     }
 }

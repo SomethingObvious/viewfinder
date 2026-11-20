@@ -1,18 +1,14 @@
-//! The Adjust sliders, applied to the RGB frame in one pass with white balance, and Auto,
-//! which picks values for them from one frame.
-//!
-//! The tone sliders make one curve folded into each channel's lookup table. HDR and Clarity
-//! work on a blurred luma made from a 16th of the pixels, so tones even out while detail stays.
+//! HDR and Clarity work on a blurred luma from a 16th of the pixels, so tones even out while
+//! detail stays.
 
 use std::fmt::Write as _;
 
 use crate::face::Face;
 use crate::store;
 
-/// All at zero leaves the picture as it is.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(crate) struct Adjust {
-    /// Stops brighter or darker.
+    /// Stops.
     pub exposure: f32,
     pub contrast: f32,
     pub highlights: f32,
@@ -24,11 +20,10 @@ pub(crate) struct Adjust {
     pub fade: f32,
     pub saturation: f32,
     pub vibrance: f32,
-    /// Below zero darkens the corners, above lightens them.
     pub vignette: f32,
 }
 
-/// Each slider's name, hover text and range, in the order `Adjust::sliders` gives them.
+/// Name, hover text and range, in the order `Adjust::sliders` gives them.
 pub(crate) const SLIDERS: [(&str, &str, f32, f32); 12] = [
     (
         "Exposure",
@@ -101,7 +96,6 @@ impl Adjust {
         *self == Self::default()
     }
 
-    /// The tone curve on a 0 to 1 scale, before HDR and Clarity.
     #[expect(
         clippy::suboptimal_flops,
         reason = "mul_add would change rounding and is a software call without FMA"
@@ -117,7 +111,6 @@ impl Adjust {
         (0.1 * self.fade).mul_add(1.0 - y, y)
     }
 
-    /// The tone curve for each 8-bit code, never falling and between 0 and 1.
     pub(crate) fn curve(&self) -> [f32; 256] {
         let mut top = 0.0f32;
         std::array::from_fn(|c| {
@@ -127,53 +120,43 @@ impl Adjust {
     }
 }
 
-/// Exposure in stops, with a shoulder above so a brighter picture rolls into white instead of
-/// clipping at a hard edge.
+/// A shoulder rolls a brighter picture into white instead of clipping at a hard edge.
 fn exposed(x: f32, stops: f32) -> f32 {
     let gain = (stops / 2.2).exp2();
     let knee = 0.5 / gain;
     if gain <= 1.0 || x <= knee {
         return x * gain;
     }
-    // A cubic from the knee, where it carries on the straight line, to white.
     let span = 1.0 - knee;
     let t = (x - knee) / span;
-    // Hermite's weights on the end point and on the slopes at each end.
     let end = t * t * 2.0f32.mul_add(-t, 3.0);
     let slopes = (span / gain).mul_add(t * t * (t - 1.0), span * gain * t * (1.0 - t).powi(2));
     0.5f32.mul_add(end, 0.5) + slopes
 }
 
-/// Weights that are 1 at their peak and 0 at black and white. `deep` peaks at a quarter and
-/// `bright` at three quarters, and each fades out well before the far end.
+/// 1 at a quarter, 0 at black and white.
 fn deep(x: f32) -> f32 {
     256.0 / 27.0 * x * (1.0 - x).powi(3)
 }
 
+/// 1 at three quarters, 0 at black and white.
 fn bright(x: f32) -> f32 {
     256.0 / 27.0 * x.powi(3) * (1.0 - x)
 }
 
-/// The blurred luma is averaged over blocks this many pixels square.
 const BLOCK: usize = 16;
-/// Every this many pixels across and down is sampled for the blurred luma.
 const SAMPLE: usize = 4;
 
-/// What one frame's pass works from. Only the tone tables are looked up per pixel. The rest
-/// are gains worked out in the loop, in 8.8 fixed point, so the compiler can run it on several
-/// pixels at once.
+/// Only the tone tables are looked up per pixel. The rest are 8.8 fixed point gains, so the
+/// compiler can run the loop on several pixels at once.
 struct Tables {
     tone: [[u8; 256]; 3],
-    /// What HDR adds to a pixel, by the blurred luma around it.
     hdr: [i32; 256],
-    /// Clarity's gain on a pixel's difference from the blurred luma, scaled so that times the
-    /// pixel's luma and its distance from white, shifted down 16, it peaks at mid grey.
+    /// Scaled so that times luma and distance from white, shifted down 16, it peaks at mid grey.
     clarity: i32,
     saturation: i32,
-    /// Vibrance at its strongest, on the dullest colours, and on skin.
     vibrance: i32,
     skin: i32,
-    /// The change in level at the corners.
     vignette: i32,
 }
 
@@ -202,34 +185,28 @@ impl Tables {
     }
 }
 
-/// Buffers kept between frames.
 #[derive(Default)]
 pub(crate) struct Pass {
     sums: Vec<i32>,
     counts: Vec<i32>,
-    /// The blurred luma, a value per block, and a spare for blurring.
     map: Vec<i32>,
     spare: Vec<i32>,
-    /// For each pixel across and down, the map columns or rows either side and the second
-    /// one's weight.
+    /// Per pixel, the map cells either side and the second one's weight.
     across: Vec<(usize, usize, i32)>,
     down: Vec<(usize, usize, i32)>,
-    /// The blurred luma and what HDR adds, lerped across to every pixel of each map row and
-    /// scaled by 256, so each pixel row only lerps between two of them.
+    /// Lerped across each map row and scaled by 256, so a pixel row only lerps between two.
     wide_base: Vec<i32>,
     wide_lift: Vec<i32>,
-    /// The current row's toned channels, one plane each.
     red: Vec<i32>,
     green: Vec<i32>,
     blue: Vec<i32>,
-    /// Squared distance from the middle across and down, each 0 to 511.
+    /// Squared distance from the middle, 0 to 511.
     vx: Vec<i32>,
     vy: Vec<i32>,
 }
 
 impl Pass {
-    /// Applies `balance` then `adjust` to a frame of RGB `pixels`, `width` wide. `window` is
-    /// the left, top, width and height of the part apps see, which the vignette centres on.
+    /// `window` is the left, top, width and height apps see, which the vignette centres on.
     #[expect(unsafe_code, reason = "calling the AVX2 build of the loop")]
     pub(crate) fn apply(
         &mut self,
@@ -266,8 +243,7 @@ impl Pass {
         self.vx.extend((0..width).map(|x| reach(x, left, w)));
         self.vy.clear();
         self.vy.extend((0..height).map(|y| reach(y, top, h)));
-        // The build targets every x86-64, whose SSE2 has no 32-bit multiply or min and max
-        // across lanes, so the loop only runs several pixels at once with AVX2.
+        // SSE2 has no 32-bit multiply or min and max across lanes, so the loop needs AVX2.
         if std::arch::is_x86_feature_detected!("avx2") {
             // SAFETY: the CPU has AVX2, checked just above.
             unsafe { self.rows_avx2(pixels, width, &t) }
@@ -281,8 +257,6 @@ impl Pass {
         self.rows(pixels, width, t);
     }
 
-    /// Each row is toned into the planes, taken through HDR, Clarity, Saturation, Vibrance
-    /// and Vignette there with nothing looked up, then put back.
     #[expect(
         clippy::inline_always,
         reason = "inlined into the AVX2 build, which only then compiles it for AVX2"
@@ -338,7 +312,6 @@ impl Pass {
         }
     }
 
-    /// Averages the toned luma over each block, blurs the blocks, and lerps them across.
     fn measure(&mut self, pixels: &[u8], width: usize, height: usize, t: &Tables) {
         let (mw, mh) = (width.div_ceil(BLOCK), height.div_ceil(BLOCK));
         for v in [&mut self.sums, &mut self.counts] {
@@ -394,12 +367,10 @@ impl Pass {
     }
 }
 
-/// Row `i` of a grid `width` wide, or nothing past its end.
 fn line(grid: &[i32], i: usize, width: usize) -> &[i32] {
     grid.get(i * width..(i + 1) * width).unwrap_or_default()
 }
 
-/// A 3 by 3 box blur of a `w` by `h` grid, the edges repeated outward.
 fn box_blur(src: &[i32], dst: &mut Vec<i32>, w: usize, h: usize) {
     let at = |x: usize, y: usize| {
         src.get(y.min(h - 1) * w + x.min(w - 1))
@@ -429,13 +400,12 @@ fn toned(tone: &[[u8; 256]; 3], [r, g, b]: [u8; 3]) -> [i32; 3] {
     [at(tr, r), at(tg, g), at(tb, b)].map(i32::from)
 }
 
-/// Rec. 709 luma, as `exposure::brightness` weighs it.
 const fn luma([r, g, b]: [i32; 3]) -> i32 {
     (54 * r + 183 * g + 19 * b) >> 8
 }
 
-/// Orange between red and yellow, where every skin tone falls. Written without short
-/// circuits so it stays a mask the compiler can run on several pixels at once.
+/// Orange between red and yellow, where every skin tone falls. No short circuits, so it stays
+/// a mask the compiler can run on several pixels at once.
 #[expect(
     clippy::needless_bitwise_bool,
     reason = "each test is one comparison, so none is worth a branch"
@@ -445,23 +415,21 @@ const fn skin([r, g, b]: [i32; 3]) -> bool {
 }
 
 struct Seen {
-    /// Luma of the part apps see, with the face counted as at least 30% of it, or with no
-    /// face the middle counted twice.
+    /// The face counts as at least 30%, or with no face the middle counts twice.
     luma: [f32; 256],
     face: Option<[f32; 256]>,
-    /// How strong the colour is on average, 0 to 1, leaving out the darkest and brightest.
-    colour: f32,
+    /// Summed colour strength and pixel count at each level.
+    colour: [(f32, f32); 256],
 }
 
-/// Where a face's skin lands best, as a share of white. Darker skin sits nearer the bottom.
-const SKIN: (f32, f32) = (0.42, 0.62);
+/// Where the darkest half percent lands. A little above zero, so shadows keep some shape.
+const BLACK: f32 = 0.02;
 
-/// Picks tone and colour sliders for one frame, as an editor's Auto Tone does. Vignette,
-/// Clarity and Fade are a matter of taste and are left at zero.
-#[expect(
-    clippy::suboptimal_flops,
-    reason = "mul_add would change rounding and is a software call without FMA"
-)]
+/// Where the middle of a face box lands best, as a share of white. It takes in eyes, brows and
+/// the shaded side, so it sits about a tenth under the skin itself.
+const SKIN: (f32, f32) = (0.36, 0.56);
+
+/// Vignette, Clarity and Fade are a matter of taste and stay at zero.
 pub(crate) fn auto(
     pixels: &[u8],
     width: usize,
@@ -470,44 +438,14 @@ pub(crate) fn auto(
     face: Option<Face>,
 ) -> Adjust {
     let seen = Seen::read(pixels, width, window, balance, face);
-    let mut a = Adjust {
-        exposure: seen.exposure(),
-        ..Adjust::default()
-    };
-    let lit = through(&seen.luma, &a.curve());
-    let (floor, ceiling) = (percentile(&lit, 0.005), percentile(&lit, 0.995));
-    let (crushed, clipped) = (share(&lit, 0.0, 0.012), share(&lit, 0.98, 1.0));
-    a.whites = if clipped > 0.005 {
-        -(clipped * 15.0).min(0.6)
-    } else {
-        ((0.95 - ceiling) / (0.25 * ceiling.max(0.3).powi(3))).clamp(0.0, 0.8)
-    };
-    a.blacks = if crushed > 0.01 {
-        (crushed * 10.0).min(0.5)
-    } else {
-        -((floor - 0.03) * 4.0).clamp(0.0, 0.6)
-    };
-    a.highlights = -(share(&lit, 0.8, 1.0) * 2.0).min(0.8);
-    a.shadows = (share(&lit, 0.0, 0.2) * 2.0).min(0.8);
-    let set = through(&seen.luma, &a.curve());
-    // The middle 80% rather than 50%, so a frame that's mostly one wall still has a spread.
-    let spread = percentile(&set, 0.9) - percentile(&set, 0.1);
-    a.contrast = ((0.6 - spread) * 2.0).clamp(-0.4, 0.8);
-    let toned = through(&seen.luma, &a.curve());
-    let backlit = seen
-        .face
-        .as_ref()
-        .is_some_and(|f| percentile(&lit, 0.9) - percentile(&through(f, &a.curve()), 0.5) > 0.4);
-    a.hdr = (4.0 * share(&toned, 0.0, 0.15).min(share(&toned, 0.85, 1.0))
-        + if backlit { 0.3 } else { 0.0 })
-    .min(0.8);
+    let mut a = seen.tones(seen.exposure());
+    // Shadows, Contrast and HDR move the face too, so it gets a second look once they're set.
     if let Some(f) = &seen.face {
-        let skin = percentile(&through(f, &a.curve()), 0.5);
-        a.shadows = (a.shadows + (SKIN.0 - skin).max(0.0) * 4.0).min(1.0);
-        a.highlights = (a.highlights - (skin - SKIN.1).max(0.0) * 4.0).max(-1.0);
+        let skin = percentile(&through(f, &a.curve()), 0.5).max(0.02);
+        let off = 2.2 * (skin.clamp(SKIN.0, SKIN.1) / skin).log2();
+        a = seen.tones((a.exposure + off).clamp(-2.0, 2.0));
     }
-    // Contrast strengthens colour on its own.
-    let colour = seen.colour * 0.3f32.mul_add(a.contrast, 1.0);
+    let colour = seen.colour_through(&a.curve());
     a.vibrance = ((0.22 - colour) * 3.0).clamp(0.0, 0.6);
     a.saturation = if colour > 0.32 {
         -((colour - 0.32) * 2.0).min(0.4)
@@ -542,7 +480,7 @@ impl Seen {
         let (qw, qh) = (w.div_euclid(4), h.div_euclid(4));
         let middle = (left + qw..left + w - qw, top + qh..top + h - qh);
         let (mut scene, mut faced) = ([0.0f32; 256], [0.0f32; 256]);
-        let (mut colour, mut counted) = (0.0f32, 0.0f32);
+        let mut colour = [(0.0f32, 0.0f32); 256];
         for (y, row) in pixels
             .chunks_exact(width * 3)
             .enumerate()
@@ -572,11 +510,10 @@ impl Seen {
                 if let Some(bin) = if on_face { &mut faced } else { &mut scene }.get_mut(level) {
                     *bin += weight;
                 }
-                if (26..=230).contains(&level) {
+                if let Some((sum, n)) = colour.get_mut(level) {
                     let [red, green, blue] = rgb;
-                    let strength = red.max(green).max(blue) - red.min(green).min(blue);
-                    colour += strength as f32 / 255.0;
-                    counted += 1.0;
+                    *sum += (red.max(green).max(blue) - red.min(green).min(blue)) as f32 / 255.0;
+                    *n += 1.0;
                 }
             }
         }
@@ -588,13 +525,81 @@ impl Seen {
                     + faced.get(i).copied().unwrap_or_default() * weight
             }),
             face: (n_face > 0.0).then_some(faced),
-            colour: colour / counted.max(1.0),
+            colour,
         }
     }
 
-    /// Stops toward bringing the frame's log average to steady exposure's target, held to
-    /// where the face's skin stays in `SKIN`. The room only counts for 70%, since a white wall
-    /// should stay a little bright and steady exposure has already metered it once.
+    /// The average colour strength once `curve` is on, which scales it by the curve's slope.
+    /// Near black and white are left out, where colour is mostly noise or clipped.
+    fn colour_through(&self, curve: &[f32; 256]) -> f32 {
+        let (mut sum, mut counted) = (0.0, 0.0);
+        for (i, &(strength, n)) in self.colour.iter().enumerate() {
+            let y = curve.get(i).copied().unwrap_or_default();
+            if (0.1..=0.9).contains(&y) {
+                let (lo, hi) = (i.saturating_sub(1), (i + 1).min(255));
+                let rise = curve.get(hi).copied().unwrap_or_default()
+                    - curve.get(lo).copied().unwrap_or_default();
+                sum += strength * rise * 255.0 / (hi - lo) as f32;
+                counted += n;
+            }
+        }
+        sum / f32::max(counted, 1.0)
+    }
+
+    #[expect(
+        clippy::suboptimal_flops,
+        reason = "mul_add would change rounding and is a software call without FMA"
+    )]
+    fn tones(&self, exposure: f32) -> Adjust {
+        let mut a = Adjust {
+            exposure,
+            ..Adjust::default()
+        };
+        let lit = through(&self.luma, &a.curve());
+        let ceiling = percentile(&lit, 0.995);
+        let clipped = share(&lit, 0.98, 1.0);
+        a.whites = if clipped > 0.005 {
+            -(clipped * 15.0).min(0.6)
+        } else {
+            ((0.95 - ceiling) / (0.25 * ceiling.max(0.3).powi(3))).clamp(0.0, 0.8)
+        };
+        a.highlights = -(share(&lit, 0.8, 1.0) * 2.0).min(0.8);
+        a.shadows = (share(&lit, 0.0, 0.2) * 2.0).min(0.8);
+        let set = through(&self.luma, &a.curve());
+        // The middle 80% rather than 50%, so a frame that's mostly one wall still has a spread.
+        let spread = percentile(&set, 0.9) - percentile(&set, 0.1);
+        a.contrast = ((0.6 - spread) * 2.0).clamp(-0.4, 0.8);
+        let toned = through(&self.luma, &a.curve());
+        let backlit = self.face.as_ref().is_some_and(|f| {
+            percentile(&lit, 0.9) - percentile(&through(f, &a.curve()), 0.5) > 0.4
+        });
+        a.hdr = (4.0 * share(&toned, 0.0, 0.15).min(share(&toned, 0.85, 1.0))
+            + if backlit { 0.3 } else { 0.0 })
+        .min(0.8);
+        if let Some(f) = &self.face {
+            let skin = percentile(&through(f, &a.curve()), 0.5);
+            a.shadows = (a.shadows + (SKIN.0 - skin).max(0.0) * 4.0).min(1.0);
+            a.highlights = (a.highlights - (skin - SKIN.1).max(0.0) * 4.0).max(-1.0);
+        }
+        // Set last, since Exposure, Shadows and HDR all lift the darkest parts and a dim room
+        // would otherwise come out grey and milky where it should be black.
+        for _ in 0..3 {
+            let floor = percentile(&through(&self.luma, &a.curve()), 0.005);
+            let raised = a.hdr * 0.4f32.mul_add(deep(floor), -0.3 * bright(floor));
+            a.blacks += (BLACK - floor - raised) / (0.25 * (1.0 - floor).powi(3));
+            a.blacks = a.blacks.clamp(-0.6, 0.5);
+        }
+        a
+    }
+
+    /// The room only counts for 70%, since a white wall should stay a little bright and steady
+    /// exposure has already metered it once. Past a stop short it counts half that again, as
+    /// a room still dark after the camera has done what it can is a dim room, and more gain
+    /// there mostly brings up grain.
+    #[expect(
+        clippy::suboptimal_flops,
+        reason = "mul_add would change rounding and is a software call without FMA"
+    )]
     fn exposure(&self) -> f32 {
         let total = self.luma.iter().sum::<f32>().max(1.0);
         let average: f32 = self
@@ -604,7 +609,8 @@ impl Seen {
             .map(|(n, l)| n * l)
             .sum::<f32>()
             / total;
-        let mut stops = 0.7 * (crate::exposure::TARGET - average);
+        let short = crate::exposure::TARGET - average;
+        let mut stops = 0.7 * short.min(1.0) + 0.35 * (short - 1.0).max(0.0);
         if let Some(f) = &self.face {
             let skin = percentile(f, 0.5).max(0.02);
             let to = |level: f32| 2.2 * (level / skin).log2();
@@ -624,7 +630,6 @@ fn through(hist: &[f32; 256], curve: &[f32; 256]) -> [f32; 256] {
     out
 }
 
-/// The level, 0 to 1, that `q` of the histogram lies below.
 fn percentile(hist: &[f32; 256], q: f32) -> f32 {
     let want = hist.iter().sum::<f32>() * q;
     let mut below = 0.0;
@@ -637,7 +642,6 @@ fn percentile(hist: &[f32; 256], q: f32) -> f32 {
     1.0
 }
 
-/// The share of the histogram from level `from` to `to`, 0 to 1 and both included.
 fn share(hist: &[f32; 256], from: f32, to: f32) -> f32 {
     let total = hist.iter().sum::<f32>().max(1.0);
     let range = (from * 255.0).round() as usize..=(to * 255.0).round() as usize;
@@ -679,14 +683,12 @@ mod tests {
     const W: usize = 1056;
     const H: usize = 704;
     const WHOLE: [usize; 4] = [0, 0, W, H];
-    /// The pixel in the middle of the frame.
     const MIDDLE: usize = H.div_euclid(2) * W + W.div_euclid(2);
 
     fn plain() -> [[u8; 256]; 3] {
         [std::array::from_fn(|c| c as u8); 3]
     }
 
-    /// Soft gradients, fine texture and a range of colours, like a room.
     fn room() -> Vec<u8> {
         (0..W * H)
             .flat_map(|i| {
@@ -707,7 +709,6 @@ mod tests {
         out
     }
 
-    /// A frame of one colour put through `adjust`, read back in the middle.
     fn one(adjust: Adjust, rgb: [u8; 3]) -> [u8; 3] {
         let mut frame = rgb.repeat(64 * 64);
         Pass::default().apply(&mut frame, 64, [0, 0, 64, 64], &plain(), &adjust);
@@ -869,7 +870,29 @@ mod tests {
         assert!(skin > 100, "the face lands at {skin}: {with:?}");
     }
 
-    /// The whole pass at the camera's size has to fit well inside a frame.
+    #[test]
+    fn auto_keeps_black_things_black_in_a_dim_room() {
+        let frame: Vec<u8> = room()
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .enumerate()
+            .flat_map(|(i, px)| {
+                if i.rem_euclid(W) > W - 150 && i.div_euclid(W) < H.div_euclid(2) {
+                    [6, 6, 7]
+                } else {
+                    px.map(|c| c.div_euclid(4))
+                }
+            })
+            .collect();
+        let a = picked(&frame, None);
+        let black = luma(pixel(&adjusted(a, &frame), W * 100 + W - 50).map(i32::from));
+        assert!(
+            a.exposure > 0.8 && black < 9,
+            "black lands at {black}: {a:?}"
+        );
+    }
+
     #[test]
     fn every_slider_fits_the_budget() {
         let frame = room();
@@ -908,10 +931,8 @@ mod tests {
                 .fold(f64::INFINITY, f64::min)
         };
         time(Some(&all));
-        let copy = time(None);
-        let ms = time(Some(&all)) - copy;
-        let single = time(Some(&with(|a, v| a.exposure = v, 0.4))) - copy;
-        println!("adjust pass at {W}x{H}: every slider {ms:.2} ms, exposure alone {single:.2} ms");
+        let ms = time(Some(&all)) - time(None);
+        println!("adjust pass at {W}x{H}: {ms:.2} ms");
         if !cfg!(debug_assertions) {
             assert!(ms < 2.0, "{ms:.2} ms per frame");
         }

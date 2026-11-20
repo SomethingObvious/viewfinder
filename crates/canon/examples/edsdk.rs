@@ -1,8 +1,5 @@
-//! Pulls live view through Canon's own EDSDK.dll for comparison with the probe, the way
-//! Canon's sample code does it (a fresh memory stream and image ref every frame).
-//!
-//! Run with `cargo run -p canon --example edsdk --release`. `EDSDK_DLL` overrides where
-//! the DLL is loaded from and `VIEWFINDER_SECS` sets how long it runs.
+//! Times live view through Canon's EDSDK.dll the way Canon's sample does, to compare with the
+//! probe. `EDSDK_DLL` overrides the DLL and `VIEWFINDER_SECS` the length.
 
 use std::collections::BTreeMap;
 use std::ffi::c_void;
@@ -116,7 +113,6 @@ fn main() -> Result<(), String> {
     result
 }
 
-/// Counts and timings from the download loop.
 struct Stats {
     frames: u32,
     not_ready: u32,
@@ -143,7 +139,6 @@ fn run(sdk: &Sdk) -> Result<(), String> {
     stats.failure.map_or(Ok(()), Err)
 }
 
-/// The first camera EDSDK lists, with its name printed.
 #[expect(unsafe_code, reason = "EDSDK is a plain DLL loaded by hand")]
 fn first_camera(sdk: &Sdk) -> Result<Ref, String> {
     let mut list: Ref = std::ptr::null_mut();
@@ -176,8 +171,6 @@ fn first_camera(sdk: &Sdk) -> Result<Ref, String> {
     Ok(camera)
 }
 
-/// Opens a session and sends live view to the PC. Returns the output device and EVF mode it
-/// found, so they can be put back.
 #[expect(unsafe_code, reason = "EDSDK is a plain DLL loaded by hand")]
 #[expect(
     clippy::disallowed_methods,
@@ -213,8 +206,6 @@ fn start_live_view(sdk: &Sdk, camera: Ref) -> Result<(u32, u32), String> {
     Ok((before, mode_before))
 }
 
-/// Downloads live view for `VIEWFINDER_SECS` seconds, 10 by default, the way Canon's sample
-/// code does it.
 #[expect(unsafe_code, reason = "EDSDK is a plain DLL loaded by hand")]
 fn pull(sdk: &Sdk, camera: Ref) -> Stats {
     let mut s = Stats {
@@ -335,7 +326,6 @@ fn report(s: &Stats) {
     }
 }
 
-/// Puts the output device and EVF mode back and closes the session.
 #[expect(unsafe_code, reason = "EDSDK is a plain DLL loaded by hand")]
 fn restore(sdk: &Sdk, camera: Ref, before: u32, mode_before: u32) {
     // SAFETY: the properties are u32s, both pointers are to live 4-byte locals, and `camera`

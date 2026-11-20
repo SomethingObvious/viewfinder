@@ -1,5 +1,4 @@
-//! The per-model differences gphoto knows about among the bodies that share EOS live view,
-//! from `is_canon_eos_m` in ptp-private.h and `camera_prepare_canon_eos_capture` in config.c.
+//! Per-model differences from gphoto's `is_canon_eos_m` and `camera_prepare_canon_eos_capture`.
 
 const OP_REMOTE_RELEASE_ON: u16 = 0x9128;
 
@@ -18,8 +17,7 @@ pub(crate) fn eos_m(model: &str, ops: &[u16]) -> bool {
         && ops.contains(&OP_REMOTE_RELEASE_ON)
 }
 
-/// The `SetRemoteMode` value that starts a remote session, or `None` for a body that must not
-/// be sent one.
+/// The `SetRemoteMode` value that starts a session, or `None` for a body that must not get one.
 pub(crate) fn remote_mode(model: &str, ops: &[u16]) -> Option<u32> {
     if !eos_m(model, ops) {
         return Some(1);
@@ -32,8 +30,8 @@ pub(crate) fn remote_mode(model: &str, ops: &[u16]) -> Option<u32> {
     }
 }
 
-/// Whether the body needs event mode 2 and live view output 8 before it streams. The M6
-/// Mark II and M50 Mark II behave like an SLR and turn tethering off if sent them.
+/// Event mode 2 and live view output 8 before streaming. The M6 Mark II and M50 Mark II act
+/// like an SLR and turn tethering off if sent them.
 pub(crate) fn wants_output_8(model: &str, ops: &[u16]) -> bool {
     eos_m(model, ops) && !matches!(model, "Canon EOS M6 Mark II" | "Canon EOS M50m2")
 }

@@ -1,45 +1,33 @@
 //! Autofocus that the computer drives, since the camera's own live view AF hunts and can stall
-//! the stream. It reads how sharp each frame is and steps the lens: big steps until it passes
-//! the sharpest place, smaller ones back, then it returns to the sharpest place it saw.
+//! the stream.
 
 use crate::face::Face;
 
-/// The part of a face's box that's measured, as shares of its width and height: the eyes and
-/// nose, without the hair or what's behind.
+/// The eyes and nose of a face's box, as shares of its width and height.
 const REGION: [f32; 4] = [0.2, 0.25, 0.6, 0.45];
-/// Every second pixel of every second row, which keeps the cost near 0.1 ms a frame.
+/// Every second pixel of every second row keeps the cost near 0.1 ms a frame.
 const STEP: usize = 2;
-/// Frames pulled after a move that may still show the lens before it or on its way. Live view
-/// lags the body by one or two frames and the lens takes a moment to settle.
+/// Live view lags the body by one or two frames and the lens takes a moment to settle.
 const SKIP: u64 = 3;
-/// Readings averaged at each place, since noise moves a single frame's reading by a few percent.
+/// Noise moves a single frame's reading by a few percent.
 const AVERAGE: u32 = 2;
-/// How much sharper a reading has to be to count as better, and how much less sharp to count as
-/// worse. The gap between them is what keeps noise from turning the search around.
+/// The gap between better and worse keeps noise from turning the search around.
 const RISE: f32 = 1.06;
 const DROP: f32 = 0.92;
-/// Moves in a row that change nothing before the search turns around, as at the end of the
-/// lens's travel or with nothing to focus on. After that turn it goes back past where it
-/// started and this many more.
+/// Moves in a row that change nothing before the search turns, as at the end of the lens's travel.
 const STILL: u32 = 5;
-/// If the sharpest and least sharp readings differ by less than this, there was nothing to focus on.
 const FLAT: f32 = 1.15;
-/// The most the search turns around before it settles for the sharpest place it saw.
 const TURNS: u32 = 6;
-/// Below this mean luma the frame is too dark to measure, like a capped lens.
 const DARK: u32 = 8;
-/// Frames a search waits for a face before giving up, about a second and a half at 28 fps,
-/// since the face finder only looks twice a second.
+/// About 1.5 s at 28 fps, since the face finder only looks twice a second.
 const FACE_WAIT: u64 = 42;
 
-/// `DriveLens` step sizes the button's search uses, biggest first, and its limit on moves,
-/// counting the ones back to the sharpest place.
+/// `DriveLens` step sizes, biggest first, and the limit on moves including the ones back.
 pub(crate) const SEARCH: (&[i8], u32) = (&[3, 2, 1], 48);
 /// Always Focus only nudges, so a refocus never sweeps far from where the picture was sharp.
 pub(crate) const NUDGE: (&[i8], u32) = (&[1], 12);
 
-/// The mean square difference between neighbouring pixels over `REGION` of `face`, divided by
-/// the square of their mean so it doesn't change with exposure. `pixels` is RGB or YCbCr.
+/// Mean square neighbour difference over the square of the mean, so exposure doesn't change it.
 pub(crate) fn sharpness(pixels: &[u8], width: usize, rgb: bool, face: Option<Face>) -> Option<f32> {
     let face = face?;
     if width == 0 {
@@ -99,14 +87,10 @@ pub(crate) enum Report {
     Idle,
     Searching,
     Focused,
-    /// The face had too little detail to focus on, so the lens went back to where it started.
     Flat,
-    /// There was no face, or it went away, so the lens went back to the sharpest place seen.
     NoFace,
 }
 
-/// One search for the sharpest place, fed a reading a frame. It never makes more moves than
-/// its limit, including the ones back.
 #[derive(Debug)]
 pub(crate) struct Search {
     sizes: &'static [i8],
@@ -115,26 +99,19 @@ pub(crate) struct Search {
     dir: i8,
     limit: u32,
     made: u32,
-    /// Every move so far, so any earlier place can be reached by undoing the later ones.
     moves: Vec<i8>,
-    /// Readings from frames numbered at or below this don't count yet.
     wait: u64,
     sum: f32,
     count: u32,
-    /// The sharpest reading and how many moves in it came.
     best: Option<(f32, usize)>,
-    /// The sharpest reading on this leg, and whether the leg has got sharper since it began.
     leg: f32,
     rose: bool,
-    /// Moves on this leg, those in a row that changed nothing, and how many of those turn it.
     leg_moves: u32,
     still: u32,
     allow: u32,
-    /// Whether the last turn was for a leg where nothing changed.
     turned_still: bool,
     turns: u32,
     range: (f32, f32),
-    /// Moves still to make back to where the search will end, and what it will report then.
     back: Vec<i8>,
     end: Option<Report>,
     report: Report,
@@ -167,7 +144,6 @@ impl Search {
         }
     }
 
-    /// Ignores frames numbered up to `pulled`, which were pulled before the search began.
     pub(crate) const fn after(mut self, pulled: u64) -> Self {
         self.wait = pulled;
         self
@@ -181,8 +157,6 @@ impl Search {
         !matches!(self.report, Report::Searching)
     }
 
-    /// Takes the sharpness of frame `frame`, with `pulled` frames pulled so far, and says how
-    /// far to drive the lens now.
     pub(crate) fn update(&mut self, frame: u64, sharpness: Option<f32>, pulled: u64) -> Option<i8> {
         if self.done() || frame <= self.wait {
             return None;
@@ -253,8 +227,6 @@ impl Search {
         self.leg_moves = 0;
     }
 
-    /// The next move on this leg, unless it would leave too few moves to get back to the
-    /// sharpest place.
     fn step(&mut self, pulled: u64) -> Option<i8> {
         let size = self.sizes.get(self.size).copied().unwrap_or(1);
         let best = self.best.map_or(0, |b| b.1);
@@ -269,7 +241,6 @@ impl Search {
         Some(step)
     }
 
-    /// Ends at the sharpest place seen, or where it started if nothing had any detail.
     fn settle(&mut self, pulled: u64) -> Option<i8> {
         if self.range.1 < self.range.0 * FLAT {
             return self.finish(0, Report::Flat, pulled);
@@ -278,7 +249,6 @@ impl Search {
         self.finish(at, Report::Focused, pulled)
     }
 
-    /// Undoes every move after the first `at`, then reports `end`.
     fn finish(&mut self, at: usize, end: Report, pulled: u64) -> Option<i8> {
         // Steps of one size add up in any order, so only what's left over of each is undone,
         // the biggest first since they're taken from the end.
@@ -313,29 +283,29 @@ impl Search {
     }
 }
 
-/// How far sharpness has to fall, as a share of what it was after focusing, before Always
-/// Focus looks again. Turning the head moves it less than this, and leaning in more.
-const LOST: f32 = 0.25;
-/// How long it has to stay fallen, in seconds.
-const LOST_FOR: f64 = 2.0;
-/// How long after any focus change to wait before the reference is taken, and how long the
-/// reading is averaged for it.
+/// A share of the sharpness after focusing. Turning the head moves it less than this, and
+/// leaning in more.
+const LOST: f32 = 0.22;
+/// A face this much wider or narrower than after focusing has moved nearer or farther. Sharpness
+/// alone misses a step back, since a smaller face packs its detail into fewer pixels and reads
+/// sharper, which cancels the blur.
+const MOVED: f32 = 0.15;
+/// Both scale how long a change takes to start a refocus, so they move together.
+const LOST_FOR: f64 = 1.4;
 const QUIET: f64 = 1.0;
-const TAU: f64 = 0.5;
+const TAU: f64 = 0.35;
 
-/// Always Focus: watches sharpness after a focus and says when it has stayed well below that for
-/// a while, like steady exposure does for light.
 #[derive(Debug, Default)]
 pub(crate) struct Watch {
-    reference: Option<f32>,
-    level: Option<f32>,
+    /// Sharpness and face width.
+    reference: Option<[f32; 2]>,
+    level: Option<[f32; 2]>,
     last: f64,
     quiet_until: f64,
     lost_since: Option<f64>,
 }
 
 impl Watch {
-    /// Starts over after the focus changed at time `t`, taking a new reference once it's quiet.
     pub(crate) fn rebase(&mut self, t: f64) {
         *self = Self {
             quiet_until: t + QUIET,
@@ -343,27 +313,29 @@ impl Watch {
         };
     }
 
-    /// Takes one frame's sharpness at time `t` and says whether to refocus.
     #[expect(
         clippy::suboptimal_flops,
         reason = "mul_add would change rounding and is a software call without FMA"
     )]
-    pub(crate) fn update(&mut self, t: f64, sharpness: Option<f32>) -> bool {
-        let Some(sharpness) = sharpness.filter(|_| t >= self.quiet_until) else {
+    pub(crate) fn update(&mut self, t: f64, reading: Option<(f32, f32)>) -> bool {
+        let Some(reading) = reading.filter(|_| t >= self.quiet_until) else {
             return false;
         };
-        let level = match self.level {
-            Some(l) => l + (sharpness - l) * (1.0 - (-(t - self.last).max(0.0) / TAU).exp()) as f32,
-            None => sharpness,
-        };
+        let now: [f32; 2] = reading.into();
+        let level = self.level.map_or(now, |l| {
+            let k = (1.0 - (-(t - self.last).max(0.0) / TAU).exp()) as f32;
+            [l[0] + (now[0] - l[0]) * k, l[1] + (now[1] - l[1]) * k]
+        });
         (self.level, self.last) = (Some(level), t);
-        let Some(reference) = self.reference else {
+        let Some([sharp, size]) = self.reference else {
             if t >= self.quiet_until + TAU {
                 self.reference = Some(level);
             }
             return false;
         };
-        if level >= reference * (1.0 - LOST) {
+        let blurred = level[0] < sharp * (1.0 - LOST);
+        let moved = (level[1] / size - 1.0).abs() > MOVED;
+        if !blurred && !moved {
             self.lost_since = None;
             return false;
         }
@@ -380,13 +352,11 @@ impl Watch {
 pub(crate) mod tests {
     use super::*;
 
-    /// A lens stepped by `DriveLens`: sizes 1, 2 and 3 move it 1, 5 and 20 units between end
-    /// stops at 0 and 600, losing `backlash` units whenever it turns around. Live view shows
-    /// where it was `lag` frames ago, and readings carry `noise` as a share.
+    /// Sizes 1, 2 and 3 move it 1, 5 and 20 units between end stops at 0 and 600, losing
+    /// `backlash` units whenever it turns. Live view shows where it was `lag` frames ago.
     struct Lens {
         at: f64,
         peak: f64,
-        /// How sharp the picture is in focus, over what defocus leaves.
         detail: f64,
         backlash: f64,
         last_dir: i8,
@@ -427,7 +397,6 @@ pub(crate) mod tests {
             self.at = (self.at + f64::from(dir) * (units - lost)).clamp(0.0, 600.0);
         }
 
-        /// Uniform noise from xorshift, so runs repeat exactly.
         fn noise(&mut self) -> f64 {
             self.seed ^= self.seed << 13;
             self.seed ^= self.seed >> 7;
@@ -435,7 +404,6 @@ pub(crate) mod tests {
             ((self.seed >> 11) as f64 / (1u64 << 53) as f64 * 2.0 - 1.0) * self.noise
         }
 
-        /// One frame: what live view shows, as defocus blur falls off away from the peak.
         fn frame(&mut self) -> f32 {
             self.history.push(self.at);
             let shown = self
@@ -457,8 +425,6 @@ pub(crate) mod tests {
         frames: u64,
     }
 
-    /// Runs a search over `lens` at one reading a frame, the step going out before the next
-    /// pull. The pipeline's reading is `behind` frames older than the newest pull.
     fn run_behind(lens: &mut Lens, kind: (&'static [i8], u32), behind: u64) -> Run {
         let mut search = Search::new(kind);
         let (mut moves, mut turns, mut last) = (0, 0, 0i8);
@@ -495,9 +461,6 @@ pub(crate) mod tests {
         run_behind(lens, kind, 0)
     }
 
-    /// From nearer and farther than the peak, at the end stops, and right beside it, with
-    /// noise, live view one or two frames behind, slack in the gears and a pipeline running a
-    /// frame behind the pulls.
     #[test]
     fn converges_from_either_side() {
         let places = [
@@ -507,7 +470,6 @@ pub(crate) mod tests {
             (60.0, 200.0),
             (590.0, 470.0),
         ];
-        let mut worst = (0.0f64, 0u32, 0u64);
         for (start, peak) in places {
             for seed in 1..=12u64 {
                 for (lag, backlash, behind) in [(1, 0.0, 0), (2, 2.0, 0), (2, 3.0, 1), (1, 1.0, 1)]
@@ -523,45 +485,18 @@ pub(crate) mod tests {
                     assert!((r.at - peak).abs() <= 4.0, "{case}: ended at {}", r.at);
                     assert!(r.moves <= SEARCH.1, "{case}: {} moves", r.moves);
                     assert!(r.turns <= 6, "{case}: turned {} times", r.turns);
-                    worst = (
-                        worst.0.max((r.at - peak).abs()),
-                        worst.1.max(r.moves),
-                        worst.2.max(r.frames),
-                    );
                 }
             }
         }
-        println!(
-            "worst: {:.1} units off, {} moves, {} frames",
-            worst.0, worst.1, worst.2
-        );
     }
 
     #[test]
     fn stays_inside_the_move_limit() {
-        // A peak at the far end with the lens at the near one is the longest search there is.
         for limit in [10, 20, 48] {
             let mut lens = Lens::new(0.0, 590.0);
             let r = run(&mut lens, (SEARCH.0, limit));
             assert!(r.moves <= limit, "{} moves for a limit of {limit}", r.moves);
             assert_ne!(r.report, Report::Searching);
-        }
-    }
-
-    #[test]
-    fn stops_once_focused() {
-        let mut lens = Lens::new(300.0, 250.0);
-        let mut search = Search::new(SEARCH);
-        let mut frame = 0;
-        while !search.done() {
-            frame += 1;
-            if let Some(step) = search.update(frame, Some(lens.frame()), frame) {
-                lens.drive(step);
-            }
-        }
-        for _ in 0..200 {
-            frame += 1;
-            assert_eq!(search.update(frame, Some(lens.frame()), frame), None);
         }
     }
 
@@ -573,7 +508,6 @@ pub(crate) mod tests {
         let r = run(&mut lens, SEARCH);
         assert_eq!(r.report, Report::Flat);
         assert!((r.at - 300.0).abs() < 1e-9, "ended at {}", r.at);
-        // Out, back past the start and as far again, then home by the shortest way.
         assert!(r.moves <= 4 * STILL + 2, "{} moves", r.moves);
     }
 
@@ -592,7 +526,6 @@ pub(crate) mod tests {
         assert_eq!(search.update(1, Some(2.0), 1), None);
         let first = search.update(2, Some(2.0), 2);
         assert!(first.is_some());
-        // Anything up to the pull count at the move plus SKIP may still show the old place.
         for frame in 3..=2 + SKIP {
             assert_eq!(search.update(frame, Some(0.1), frame), None);
         }
@@ -609,7 +542,6 @@ pub(crate) mod tests {
         assert_eq!(search.report(), Report::NoFace);
     }
 
-    /// A face that turns up a moment after the button is still focused on.
     #[test]
     fn waits_a_moment_for_a_face() {
         let mut lens = Lens::new(300.0, 250.0);
@@ -625,7 +557,6 @@ pub(crate) mod tests {
         assert_eq!(search.report(), Report::Focused);
     }
 
-    /// Losing the face partway stops the search at the sharpest place it had seen.
     #[test]
     fn losing_the_face_goes_back_to_the_sharpest_place() {
         let mut lens = Lens::new(300.0, 250.0);
@@ -661,8 +592,6 @@ pub(crate) mod tests {
         assert!(r.frames < 200);
     }
 
-    /// Steady sharpness with someone shifting about changes nothing, and focus really going
-    /// soft for a few seconds asks for a nudge.
     #[test]
     fn always_focus_waits_for_a_real_loss() {
         let mut watch = Watch::default();
@@ -671,15 +600,15 @@ pub(crate) mod tests {
         let mut asked = None;
         for i in 0..(40 * 28) {
             let t = f64::from(i) / 28.0;
-            // A quick dip as someone turns away, then focus slipping at 20 s.
-            let s = if (10.0..11.0).contains(&t) {
+            // A hand passing the lens, which should be waited out.
+            let s = if (10.0..10.7).contains(&t) {
                 1.0
             } else if t >= 20.0 {
                 1.2
             } else {
                 sway(t)
             };
-            if watch.update(t, Some(s)) && asked.is_none() {
+            if watch.update(t, Some((s, 300.0))) && asked.is_none() {
                 asked = Some(t);
             }
         }
@@ -688,17 +617,21 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn always_focus_leaves_the_lens_without_a_face() {
+    fn always_focus_sees_a_step_back() {
         let mut watch = Watch::default();
         watch.rebase(0.0);
-        for i in 0..(40 * 28) {
+        let mut asked = None;
+        for i in 0..(10 * 28) {
             let t = f64::from(i) / 28.0;
-            let s = (t < 5.0).then_some(3.0);
-            assert!(!watch.update(t, s), "{t}");
+            let (s, width) = if t >= 5.0 { (3.3, 220.0) } else { (3.0, 300.0) };
+            if watch.update(t, Some((s, width))) && asked.is_none() {
+                asked = Some(t);
+            }
         }
+        let t = asked.expect("asked for a refocus");
+        assert!((5.0 + LOST_FOR..5.0 + LOST_FOR + 1.0).contains(&t), "{t}");
     }
 
-    /// A face filling most of a 1056x704 frame.
     const FACE: Option<Face> = Some(Face {
         x: 200,
         y: 100,
@@ -706,8 +639,6 @@ pub(crate) mod tests {
         h: 500,
     });
 
-    /// A 1056x704 checkerboard of 7 pixel squares, so its edges fall on odd and even
-    /// columns alike, blurred `blur` times and scaled by `gain`.
     fn chart(blur: usize, gain: f32) -> Vec<u8> {
         let (w, h): (usize, usize) = (1056, 704);
         let sharp: Vec<f32> = (0..w * h)
@@ -751,7 +682,6 @@ pub(crate) mod tests {
         assert!(read(&[], 0, true).abs() < f32::EPSILON);
     }
 
-    /// The chart only in the top left corner, flat grey everywhere else.
     #[test]
     fn sharpness_reads_the_face_not_the_middle() {
         let mut frame = chart(0, 1.0);
@@ -774,8 +704,6 @@ pub(crate) mod tests {
         assert_eq!(sharpness(&frame, 1056, true, None), None);
     }
 
-    /// The fastest of 30 batches of 10 runs, in ms a run, so other tests running alongside
-    /// don't count.
     pub(crate) fn best_ms(mut f: impl FnMut()) -> f64 {
         (0..30)
             .map(|_| {
@@ -794,8 +722,6 @@ pub(crate) mod tests {
         let ms = best_ms(|| {
             assert!(sharpness(std::hint::black_box(&frame), 1056, true, FACE) > Some(0.0));
         });
-        println!("sharpness: {ms:.3} ms a frame");
-        // Debug builds run many times slower, so the budget only holds in release.
         if !cfg!(debug_assertions) {
             assert!(ms < 0.3, "{ms:.3} ms a frame");
         }

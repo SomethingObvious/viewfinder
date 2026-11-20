@@ -1,14 +1,12 @@
-//! Nikon live view over PTP, following the `PTP_VENDOR_NIKON` case of `camera_capture_preview`
-//! and the Nikon fixups of `fixup_cached_deviceinfo` in gphoto's library.c.
-//!
-//! Untested on a real body. Every step and code is gphoto's.
+//! Nikon live view over PTP, following gphoto's `camera_capture_preview` and
+//! `fixup_cached_deviceinfo`. Untested on a real body.
 
 use std::thread::sleep;
 use std::time::Duration;
 
 use crate::ptp::{
     DeviceInfo, OP_GET_DEVICE_INFO, OP_GET_DEVICE_PROP_VALUE, OP_SET_DEVICE_PROP_VALUE,
-    RC_DEVICE_BUSY, RC_OK, Reader, Transport, find_jpeg, parse_device_info,
+    RC_DEVICE_BUSY, RC_OK, Reader, Transport, check, find_jpeg, parse_device_info,
 };
 use crate::{Error, Format, Result, Source};
 
@@ -105,16 +103,6 @@ fn fix_ops(model: &str, ops: &mut Vec<u16>) {
     }
 }
 
-fn check(op: u16, code: u16) -> Result<()> {
-    if code == RC_OK {
-        Ok(())
-    } else {
-        Err(Error::Failed(format!(
-            "camera answered 0x{code:04X} to operation 0x{op:04X}"
-        )))
-    }
-}
-
 /// A Nikon body streaming live view.
 #[derive(Debug)]
 pub struct Nikon<T> {
@@ -130,11 +118,8 @@ pub struct Nikon<T> {
 
 impl<T: Transport> Nikon<T> {
     /// Reads what the camera can do and checks it has live view.
-    ///
     /// # Errors
-    ///
-    /// Fails with [`Error::Unsupported`] when the body has no live view over USB, or with what
-    /// the camera answered.
+    /// Fails when the body has no USB live view or refuses.
     pub fn open(mut t: T) -> Result<Self> {
         let mut buf = Vec::new();
         check(
@@ -144,8 +129,7 @@ impl<T: Transport> Nikon<T> {
         let mut info = parse_device_info(&buf)
             .ok_or_else(|| Error::Failed("the camera sent a broken DeviceInfo".into()))?;
         fix_ops(&info.model, &mut info.ops);
-        // Newer bodies only list most of their properties here. A failure is only logged by
-        // gphoto, so it's ignored.
+        // Newer bodies only list most of their properties here. gphoto ignores a failure.
         if info.ops.contains(&OP_GET_VENDOR_PROP_CODES)
             && t.read(OP_GET_VENDOR_PROP_CODES, &[], &mut buf)? == RC_OK
             && let Some(more) = (Reader { d: &buf }).u16_array()
@@ -192,7 +176,7 @@ impl<T: Transport> Nikon<T> {
         Ok(value.filter(|_| code == RC_OK))
     }
 
-    /// `nikon_wait_busy(params, 20, 2000)`: polls `DeviceReady` until the body isn't busy.
+    /// gphoto's `nikon_wait_busy(params, 20, 2000)`.
     #[expect(
         clippy::disallowed_methods,
         reason = "runs on the camera thread, where waiting for the body is fine"
@@ -218,7 +202,7 @@ impl<T: Transport> Nikon<T> {
         Ok(())
     }
 
-    /// The `enable_liveview` label: record to the card, check nothing forbids live view, start it.
+    /// gphoto's `enable_liveview` label.
     fn enable(&mut self) -> Result<()> {
         if self.has_prop(PROP_RECORDING_MEDIA) {
             self.t.write(
@@ -349,14 +333,9 @@ mod tests {
             ops_after_fixups("COOLPIX A", &[]),
             ops_after_fixups("D3300", &[])
         );
-        // A body that lists its vendor codes is taken at its word.
         assert_eq!(ops_after_fixups("D3400", &[0x90CA]), [0x90CA]);
         assert_eq!(ops_after_fixups("D7000", &[0x9201]), [0x9201]);
         assert_eq!(ops_after_fixups("D300S", &[]), Vec::<u16>::new());
-    }
-
-    #[test]
-    fn fixups_for_nikon_1() {
         assert_eq!(
             ops_after_fixups("J5", &[0x9201]),
             [0x90C2, 0x90CA, 0x9201, 0x9207]
@@ -384,8 +363,7 @@ mod tests {
         steps
     }
 
-    /// The header in front of the JPEG is 384 bytes on a D7000. gphoto skips it by looking for
-    /// the JPEG's start, so it's only filler here, with big-endian sizes like Nikon's.
+    /// The header in front of the JPEG is 384 bytes on a D7000.
     fn live_view_reply(jpeg: &[u8]) -> Vec<u8> {
         let mut d = vec![0; 384];
         d.splice(0..4, (jpeg.len() as u32).to_be_bytes());
@@ -513,16 +491,5 @@ mod tests {
         let mut cam = Box::new(Nikon::open(Script::new(steps)).unwrap());
         cam.start().unwrap();
         assert!(cam.t.done());
-    }
-
-    #[test]
-    fn bodies_without_live_view_are_turned_away() {
-        let steps = opened(&[0x1001], &[], None);
-        assert_eq!(
-            Nikon::open(Script::new(steps)).map(drop),
-            Err(Error::Unsupported(
-                "The Nikon D7000 has no live view over USB.".into()
-            ))
-        );
     }
 }

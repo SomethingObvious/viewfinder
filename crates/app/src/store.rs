@@ -6,24 +6,27 @@ pub(crate) fn path(name: &str) -> Option<PathBuf> {
     std::env::var_os("APPDATA").map(|d| PathBuf::from(d).join("Viewfinder").join(name))
 }
 
-/// The file's text, or None if it's missing.
 pub(crate) fn read(name: &str) -> Option<String> {
     std::fs::read_to_string(path(name)?).ok()
 }
 
-/// Makes the folder if it's missing and writes the file. True if it was written.
 pub(crate) fn write(name: &str, text: &str) -> bool {
-    let Some(path) = path(name) else { return false };
+    path(name).is_some_and(|path| write_at(&path, text))
+}
+
+/// Writes beside the file and swaps it in, so a crash mid-write can't leave half a file.
+pub(crate) fn write_at(path: &std::path::Path, text: &str) -> bool {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).ok();
     }
-    std::fs::write(path, text).is_ok()
+    let part = path.with_extension("part");
+    std::fs::write(&part, text).is_ok() && std::fs::rename(&part, path).is_ok()
 }
 
-/// Each `key=value` line whose value is a number.
 pub(crate) fn numbers(text: &str) -> impl Iterator<Item = (&str, f32)> {
     text.lines().filter_map(|line| {
         let (key, value) = line.split_once('=')?;
-        Some((key.trim(), value.trim().parse().ok()?))
+        let value: f32 = value.trim().parse().ok()?;
+        value.is_finite().then_some((key.trim(), value))
     })
 }

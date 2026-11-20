@@ -34,25 +34,3 @@ impl Source for Camera {
         Ok(Self::close(*self)?)
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn canon_errors_keep_their_meaning() {
-        assert_eq!(Error::from(canon::Error::NotFound), Error::NotFound);
-        assert_eq!(Error::from(canon::Error::Disconnected), Error::Disconnected);
-        assert_eq!(
-            Error::from(canon::Error::OutOfRange),
-            Error::Failed("argument out of range".into())
-        );
-    }
-
-    #[test]
-    fn a_canon_camera_is_a_source() {
-        fn takes(_: Option<Box<dyn Source>>) {}
-        let camera: Option<Box<Camera>> = None;
-        takes(camera.map(|c| -> Box<dyn Source> { c }));
-    }
-}

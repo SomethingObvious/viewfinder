@@ -31,14 +31,13 @@ pub(crate) fn hidden_card(f: Format) -> Vec<u8> {
     luma
 }
 
-/// "Camera Hidden" in the middle, laid out by egui and copied from its glyph atlas.
 fn legend(luma: &mut [u8], w: usize, h: usize, ppp: f32) {
     let mut fonts = Fonts::new(TextOptions::default(), super::font_definitions());
     let galley = fonts
         .with_pixels_per_point(ppp)
         .layout_job(finish::label_job("Camera Hidden", LABEL, INK));
     let atlas = fonts.image();
-    let size = (galley.size() - Vec2::new(finish::trail(&galley), 0.0)) * ppp;
+    let size = galley.size() * ppp;
     let origin = Vec2::new(w as f32 - size.x, h as f32 - size.y) / 2.0;
     for row in &galley.rows {
         for g in row.glyphs.iter().filter(|g| !g.uv_rect.is_nothing()) {
@@ -65,7 +64,6 @@ fn legend(luma: &mut [u8], w: usize, h: usize, ppp: f32) {
     }
 }
 
-/// Title-safe corners in Edge, as an empty monitor in the window shows.
 fn corners(luma: &mut [u8], w: usize, h: usize, stroke: usize) {
     let (x0, y0) = ((w * 8).div_euclid(100), (h * 8).div_euclid(100));
     let (x1, y1) = (w - x0, h - y0);

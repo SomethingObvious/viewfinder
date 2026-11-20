@@ -1,9 +1,49 @@
-//! The Media Foundation media source Frame Server loads for the Viewfinder
-//! virtual camera. It serves the newest frame the app left in shared memory.
-//!
-//! Everything here runs inside the Frame Server service, where a crash takes
-//! every camera down for every app. So each COM method and export catches
-//! panics and turns them into an HRESULT.
+//! The media source Frame Server loads for the virtual camera, serving the newest frame in
+//! shared memory. A crash here takes every camera down for every app, so each COM method and
+//! export catches panics.
+
+macro_rules! forward_events {
+    ($impl:ty) => {
+        #[expect(
+            unsafe_code,
+            reason = "every method forwards to the event queue's COM methods"
+        )]
+        impl IMFMediaEventGenerator_Impl for $impl {
+            fn GetEvent(
+                &self,
+                flags: MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS,
+            ) -> Result<IMFMediaEvent> {
+                // SAFETY: forwards Frame Server's arguments untouched.
+                guard(|| unsafe { self.queue.GetEvent(flags.0) })
+            }
+
+            fn BeginGetEvent(
+                &self,
+                callback: Ref<'_, IMFAsyncCallback>,
+                state: Ref<'_, IUnknown>,
+            ) -> Result<()> {
+                // SAFETY: forwards Frame Server's arguments untouched.
+                guard(|| unsafe { self.queue.BeginGetEvent(callback.as_ref(), state.as_ref()) })
+            }
+
+            fn EndGetEvent(&self, result: Ref<'_, IMFAsyncResult>) -> Result<IMFMediaEvent> {
+                // SAFETY: forwards Frame Server's arguments untouched.
+                guard(|| unsafe { self.queue.EndGetEvent(result.as_ref()) })
+            }
+
+            fn QueueEvent(
+                &self,
+                met: u32,
+                extended: *const GUID,
+                status: HRESULT,
+                value: *const PROPVARIANT,
+            ) -> Result<()> {
+                // SAFETY: forwards Frame Server's arguments untouched.
+                guard(|| unsafe { self.queue.QueueEventParamVar(met, extended, status, value) })
+            }
+        }
+    };
+}
 
 mod activate;
 mod source;
@@ -26,7 +66,6 @@ use factory::{Factory, Factory_Impl};
 /// Live COM objects plus server locks, for `DllCanUnloadNow`.
 static LIVE: AtomicIsize = AtomicIsize::new(0);
 
-/// Counts one live object for as long as it exists.
 #[derive(Debug)]
 struct Live;
 
@@ -43,18 +82,16 @@ impl Drop for Live {
     }
 }
 
-/// Runs a COM method body, turning a panic into `E_UNEXPECTED`.
 fn guard<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
     catch_unwind(AssertUnwindSafe(f)).unwrap_or_else(|_| Err(E_UNEXPECTED.into()))
 }
 
-/// Locks a mutex even if a caught panic poisoned it, since the service has
-/// to keep running either way.
+/// Ignores poisoning from a caught panic, since the service has to keep running.
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// The class factory on its own, since everything `#[implement]` generates lands beside it.
+/// Its own module, since everything `#[implement]` generates lands beside it.
 #[expect(
     unsafe_code,
     trivial_casts,
@@ -105,7 +142,6 @@ impl IClassFactory_Impl for Factory_Impl {
 }
 
 /// Hands out the class factory for [`shared::CLSID`].
-///
 /// # Safety
 /// The pointers must be valid as COM requires.
 #[expect(
@@ -135,7 +171,7 @@ pub unsafe extern "system" fn DllGetClassObject(
     result.map_or_else(|e| e.code(), |()| S_OK)
 }
 
-/// Says whether every object this DLL handed out is gone.
+/// `S_OK` once every object this DLL handed out is gone.
 #[expect(unsafe_code, reason = "COM finds this export by name")]
 #[unsafe(no_mangle)]
 pub extern "system" fn DllCanUnloadNow() -> HRESULT {

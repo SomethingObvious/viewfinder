@@ -1,16 +1,12 @@
-//! Sony live view over PTP, for bodies with the USB connection set to PC Remote.
-//!
-//! It follows the SDIO handshake in `fixup_cached_deviceinfo` and the `PTP_VENDOR_SONY` case
-//! of `camera_capture_preview` in gphoto's library.c.
-//!
-//! Untested on a real body. Every step and code is gphoto's.
+//! Sony live view over PTP in PC Remote mode, following gphoto's `fixup_cached_deviceinfo` and
+//! `camera_capture_preview`. Untested on a real body.
 
 use std::thread::sleep;
 use std::time::Duration;
 
 use crate::ptp::{
     DeviceInfo, OP_GET_DEVICE_INFO, OP_GET_OBJECT, OP_GET_OBJECT_INFO, RC_ACCESS_DENIED,
-    RC_INVALID_OBJECT_HANDLE, RC_OK, Reader, Transport, find_jpeg, parse_device_info,
+    RC_INVALID_OBJECT_HANDLE, RC_OK, Reader, Transport, check, find_jpeg, parse_device_info,
 };
 use crate::{Error, Format, Result, Source};
 
@@ -23,17 +19,6 @@ const PROP_PRIORITY_MODE: u16 = 0xD25A;
 /// The object handle the live view frame is read from, on the Alpha bodies and the QX alike.
 const LIVE_VIEW: u32 = 0xFFFF_C002;
 
-fn check(op: u16, code: u16) -> Result<()> {
-    if code == RC_OK {
-        Ok(())
-    } else {
-        Err(Error::Failed(format!(
-            "camera answered 0x{code:04X} to operation 0x{op:04X}"
-        )))
-    }
-}
-
-/// How many codes a `GetExtDeviceInfo` reply lists, after its version.
 fn ext_codes(d: &[u8]) -> usize {
     let mut r = Reader { d };
     if r.take(2).is_none() {
@@ -43,9 +28,8 @@ fn ext_codes(d: &[u8]) -> usize {
     props + r.u16_array().map_or(0, |a| a.len())
 }
 
-/// The live view JPEG in a `GetObject` reply. The reply starts with the JPEG's offset, which
-/// is trusted when it points at FF D8, since the header in front can hold FF D8 itself
-/// (gphoto2 issue 389).
+/// The reply's leading offset is trusted only when it points at FF D8, since the header can
+/// hold FF D8 itself (gphoto2 issue 389).
 fn live_view_jpeg(d: &[u8]) -> Option<&[u8]> {
     let offset = d
         .get(..4)
@@ -70,11 +54,12 @@ pub struct Sony<T> {
 
 impl<T: Transport> Sony<T> {
     /// Runs the SDIO handshake that puts the body under the PC's control.
-    ///
     /// # Errors
-    ///
-    /// Fails with [`Error::Unsupported`] when the body isn't in PC Remote mode, or with what the
-    /// camera answered.
+    /// Fails when the body isn't in PC Remote mode or refuses.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "runs on the camera thread while the body wakes up"
+    )]
     pub fn open(mut t: T) -> Result<Self> {
         let mut buf = Vec::new();
         check(
@@ -99,19 +84,20 @@ impl<T: Transport> Sony<T> {
                 t.read(OP_SDIO_CONNECT, &[phase, 0, 0], &mut buf)?,
             )?;
         }
-        // The list comes back empty for a while after connecting.
+        // The list comes back empty for a while after connecting, so the body gets 2 s.
         for _ in 0..20 {
             let code = t.read(OP_SDIO_GET_EXT_DEVICE_INFO, &[PROTOCOL_3_00, 1], &mut buf)?;
             check(OP_SDIO_GET_EXT_DEVICE_INFO, code)?;
             if ext_codes(&buf) > 0 {
                 break;
             }
+            sleep(Duration::from_millis(100));
         }
         check(
             OP_SDIO_CONNECT,
             t.read(OP_SDIO_CONNECT, &[3, 0, 0], &mut buf)?,
         )?;
-        // Puts the PC in charge rather than the body's dials. gphoto only logs a refusal.
+        // Puts the PC in charge of the dials. gphoto ignores a refusal too.
         t.write(
             OP_SDIO_SET_EXT_DEVICE_PROP_VALUE,
             &[PROP_PRIORITY_MODE.into()],
@@ -192,7 +178,6 @@ mod tests {
         steps
     }
 
-    /// A reply whose header holds a stray FF D8 before the offset it gives.
     fn reply(jpeg: &[u8]) -> Vec<u8> {
         let mut d = 16u32.to_le_bytes().to_vec();
         d.extend([0, 0, 0, 0, 0xFF, 0xD8, 0xFF, 0xD9, 0, 0, 0, 0]);

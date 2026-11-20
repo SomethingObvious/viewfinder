@@ -15,7 +15,6 @@ fn wpd_err(e: &windows_core::Error) -> Error {
     }
 }
 
-/// A WPD device, with the MTA kept alive for as long as it's open.
 #[derive(Debug)]
 struct Device {
     wpd: Wpd,
@@ -36,10 +35,8 @@ impl Transport for Device {
     }
 }
 
-/// `WPD_DEVICE_TYPE_CAMERA`.
 const WPD_CAMERA: u32 = 1;
 
-/// Every PTP body from a maker Viewfinder knows, with its WPD `PnP` id.
 fn bodies() -> Result<Vec<(String, Choice)>> {
     let _mta = Mta::enter()?;
     let ids = device_ids().map_err(|e| wpd_err(&e))?;
@@ -66,8 +63,7 @@ pub fn ptp_id(choice: &Choice) -> Option<String> {
     Some(bodies.swap_remove(at).0)
 }
 
-/// Every camera Viewfinder could use: PTP bodies first, then webcams and capture cards. One
-/// that Windows won't list is left out.
+/// Every camera Viewfinder could use, PTP bodies first.
 #[must_use]
 pub fn list() -> Vec<Choice> {
     let mut all: Vec<Choice> = bodies()
@@ -80,11 +76,8 @@ pub fn list() -> Vec<Choice> {
 }
 
 /// Opens the camera `choice` names and nothing else.
-///
 /// # Errors
-///
-/// Fails with [`Error::NotFound`] when it isn't plugged in or is off, [`Error::Unsupported`]
-/// when it has no live view over USB, or with what the camera answered.
+/// Fails when the camera is missing, has no USB live view, or refuses.
 pub fn open(choice: &Choice) -> Result<Box<dyn Source>> {
     let Choice::Ptp { vendor, model } = choice else {
         return Ok(Box::new(crate::mf::open_choice(choice)?));

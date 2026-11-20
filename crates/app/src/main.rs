@@ -11,6 +11,7 @@ mod general;
 mod pipeline;
 mod pixels;
 mod selection;
+mod setup;
 mod store;
 mod ui;
 mod usage;
@@ -47,10 +48,12 @@ fn main() -> eframe::Result {
         return done;
     }
     let background = args.iter().any(|a| a == "--background");
+    setup::wait_after_restart(&args);
     // Two copies would fight over the camera, so a second launch shows the first.
     let Some(raise) = first_instance() else {
         return Ok(());
     };
+    full_speed();
     let hub = Hub::new(load_look());
     *worker::lock(&hub.exposure) = exposure::load();
     *worker::lock(&hub.adjust) = adjust::load();
@@ -100,13 +103,12 @@ fn main() -> eframe::Result {
             .with_decorations(false),
         ..Default::default()
     };
-    let q = quitting;
     let result = eframe::run_native(
         "Viewfinder",
         options,
         Box::new(move |cc| {
-            listen(&cc.egui_ctx, &raise, [&open, &hide, &quit], &q, &hub);
-            let mut app = ui::App::new(cc, hub, commands, q, !background);
+            listen(&cc.egui_ctx, &raise, [&open, &hide, &quit], &quitting, &hub);
+            let mut app = ui::App::new(cc, hub, commands, quitting, !background);
             app.tray = Some(Tray {
                 hide,
                 hwnd: tray_hwnd,
@@ -124,7 +126,6 @@ fn main() -> eframe::Result {
     result
 }
 
-/// Runs a flag that does one job and exits, if `args` holds one.
 #[expect(unsafe_code, reason = "signalling the running copy is a Win32 call")]
 #[expect(
     clippy::print_stderr,
@@ -140,8 +141,11 @@ fn run_command(args: &[String]) -> Option<eframe::Result> {
         return Some(Ok(()));
     }
     if args.iter().any(|a| a == "--name-camera") {
+        // This runs as administrator, so it writes nothing in the user's folders, where a
+        // junction could aim it at a protected file. Task Scheduler keeps the exit code.
         if let Err(e) = vcam::name_interfaces() {
-            worker::log(&format!("couldn't rename the camera ({e})"));
+            eprintln!("Couldn't rename the camera ({e})");
+            std::process::exit(1);
         }
         return Some(Ok(()));
     }
@@ -149,8 +153,7 @@ fn run_command(args: &[String]) -> Option<eframe::Result> {
         return Some(ui::demo::run());
     }
     if args.iter().any(|a| a == "--quit") {
-        // Through the tray's Quit, since killing the process while the NVIDIA effects ran
-        // left the driver logging GPU errors.
+        // Killing the process while the NVIDIA effects ran left the driver logging GPU errors.
         // SAFETY: the name is a static wide string.
         let opened = unsafe { OpenEventW(EVENT_MODIFY_STATE, false, w!("Local\\Viewfinder-quit")) };
         if let Ok(event) = opened {
@@ -162,7 +165,6 @@ fn run_command(args: &[String]) -> Option<eframe::Result> {
     None
 }
 
-/// Runs the virtual camera on its own MTA thread until the sender is used or dropped.
 #[expect(unsafe_code, reason = "starting Media Foundation is a Win32 call")]
 fn spawn_vcam(hub: Arc<Hub>) -> (mpsc::Sender<()>, Option<thread::JoinHandle<()>>) {
     let (stop_vcam, vcam_stopped) = mpsc::channel::<()>();
@@ -186,7 +188,6 @@ fn spawn_vcam(hub: Arc<Hub>) -> (mpsc::Sender<()>, Option<thread::JoinHandle<()>
     (stop_vcam, vcam_thread)
 }
 
-/// The tray's Hide Camera item, and the window that owns the icon for notifications.
 pub(crate) struct Tray {
     pub(crate) hide: MenuItem,
     pub(crate) hwnd: isize,
@@ -228,8 +229,6 @@ impl Tray {
     }
 }
 
-/// Shows the window when a second launch or the tray asks, closes it when `--quit` or the
-/// tray's Quit does, and hides or shows the camera from the tray.
 #[expect(unsafe_code, reason = "waiting on the named events is Win32")]
 fn listen(
     ctx: &egui::Context,
@@ -246,6 +245,7 @@ fn listen(
         ctx.request_repaint();
     };
     let c = ctx.clone();
+    let quit_signal = raise.1;
     let raise = raise.0;
     thread::spawn(move || {
         // SAFETY: the event handle stays open for the life of the process.
@@ -257,12 +257,10 @@ fn listen(
     });
     let (c, quitting) = (ctx.clone(), q.clone());
     thread::spawn(move || {
-        // SAFETY: the name is a static wide string.
-        let Ok(event) = (unsafe { CreateEventW(None, false, false, w!("Local\\Viewfinder-quit")) })
-        else {
+        let Some(event) = quit_signal.map(|q| HANDLE(q as *mut std::ffi::c_void)) else {
             return;
         };
-        // SAFETY: the event was just created and is never closed.
+        // SAFETY: `first_instance` made the event, and nothing closes it.
         if unsafe { WaitForSingleObject(event, INFINITE) }.0 == 0 {
             quitting.store(true, Ordering::Relaxed);
             c.send_viewport_cmd(ViewportCommand::Close);
@@ -295,7 +293,6 @@ fn listen(
     }));
 }
 
-/// Ctrl+Alt+H hides or shows the camera and Ctrl+Alt+F focuses, whichever app is in front.
 #[expect(unsafe_code, reason = "global hotkeys are Win32")]
 fn hotkeys(hub: Arc<Hub>, commands: mpsc::Sender<worker::Command>) {
     let spawned = thread::Builder::new()
@@ -330,17 +327,102 @@ fn hotkeys(hub: Arc<Hub>, commands: mpsc::Sender<worker::Command>) {
     }
 }
 
-/// Joins the calling thread to the COM MTA, which the camera and Media Foundation need.
+/// Joins the COM MTA, which the camera and Media Foundation need.
 #[expect(unsafe_code, reason = "joining the MTA is a COM call")]
 pub fn mta() {
     // SAFETY: no reserved pointer, and a thread already in the MTA just gets S_FALSE.
     unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).ok().ok() };
 }
 
-/// The auto-reset event a second launch sets, wrapped so the handle can cross threads.
-struct Raise(isize);
+/// The raise event, and the quit event made before the window, so a `--quit` sent while it
+/// starts isn't missed.
+struct Raise(isize, Option<isize>);
 
-/// None when another copy is already running, after asking it to show its window.
+/// The owner and SYSTEM can do anything, and administrators can set it. Without that an
+/// administrator installing for someone else can't ask this copy to quit, so install.ps1 kills
+/// it, which upsets the NVIDIA driver mid effect.
+#[expect(
+    unsafe_code,
+    reason = "named events and security descriptors are Win32"
+)]
+fn quit_event() -> windows::core::Result<HANDLE> {
+    use windows::Win32::Foundation::{CloseHandle, HLOCAL, LocalFree};
+    use windows::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+    };
+    use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
+    let mut sd = PSECURITY_DESCRIPTOR::default();
+    // SAFETY: the SDDL is a static wide string and `sd` is a live out slot, freed below.
+    unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            w!("D:(A;;GA;;;OW)(A;;GA;;;SY)(A;;0x100002;;;BA)"),
+            SDDL_REVISION_1,
+            &raw mut sd,
+            None,
+        )?;
+    }
+    let sa = SECURITY_ATTRIBUTES {
+        nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: sd.0,
+        bInheritHandle: false.into(),
+    };
+    // SAFETY: `sa` outlives the call and the name is a static wide string.
+    let event = unsafe {
+        CreateEventW(
+            Some(&raw const sa),
+            false,
+            false,
+            w!("Local\\Viewfinder-quit"),
+        )
+    };
+    // This copy is the first, so an event that's already there was made by something else,
+    // which may have set its own permissions. It's left alone and the installer falls back to
+    // ending the process.
+    // SAFETY: takes nothing, and reads the error CreateEventW just left.
+    let taken = event.is_ok() && unsafe { GetLastError() } == ERROR_ALREADY_EXISTS;
+    // SAFETY: the SDDL call says to free `sd` with LocalFree, and nothing uses it after this.
+    unsafe { LocalFree(Some(HLOCAL(sd.0))) };
+    if taken {
+        if let Ok(e) = &event {
+            // SAFETY: the handle was just opened and isn't used again.
+            unsafe { CloseHandle(*e) }.ok();
+        }
+        return Err(ERROR_ALREADY_EXISTS.to_hresult().into());
+    }
+    event
+}
+
+/// Windows 11 can put a program with no window showing on efficiency clocks, and with the
+/// window closed this still runs the camera, the focus and the call app's frames.
+#[expect(
+    unsafe_code,
+    reason = "setting a process's power policy is a Win32 call"
+)]
+fn full_speed() {
+    use windows::Win32::System::Threading::{
+        GetCurrentProcess, PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+        PROCESS_POWER_THROTTLING_EXECUTION_SPEED, PROCESS_POWER_THROTTLING_STATE,
+        ProcessPowerThrottling, SetProcessInformation,
+    };
+    // A control bit with its state bit clear turns that throttling off.
+    let state = PROCESS_POWER_THROTTLING_STATE {
+        Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+        ControlMask: PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+        StateMask: 0,
+    };
+    // SAFETY: `state` is a live local and the size passed is its own.
+    unsafe {
+        SetProcessInformation(
+            GetCurrentProcess(),
+            ProcessPowerThrottling,
+            (&raw const state).cast(),
+            size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32,
+        )
+    }
+    .ok();
+}
+
+/// None when another copy is running, after asking it to show its window.
 #[expect(unsafe_code, reason = "named events are Win32")]
 fn first_instance() -> Option<Raise> {
     // SAFETY: the name is a static wide string.
@@ -351,11 +433,13 @@ fn first_instance() -> Option<Raise> {
         unsafe { SetEvent(event) }.ok();
         return None;
     }
-    Some(Raise(event.0 as isize))
+    Some(Raise(
+        event.0 as isize,
+        quit_event().ok().map(|q| q.0 as isize),
+    ))
 }
 
-/// The mark's geometry in an icon `n` pixels square, shared with the title bar. The small
-/// sizes are placed by hand on the pixel grid so they stay sharp.
+/// The small sizes are placed by hand on the pixel grid so they stay sharp.
 pub(crate) struct Brackets {
     x: u32,
     y: u32,
@@ -405,7 +489,6 @@ impl Brackets {
         }
     }
 
-    /// The eight bars of the four brackets, as x, y, width and height.
     pub(crate) const fn bars(&self) -> [[u32; 4]; 8] {
         let Self {
             x,
@@ -442,7 +525,6 @@ impl Brackets {
     }
 }
 
-/// The app's mark at `n` pixels square, as RGBA.
 #[must_use]
 pub(crate) fn mark(n: u32) -> Vec<u8> {
     let b = Brackets::new(n);
@@ -463,7 +545,6 @@ pub(crate) fn mark(n: u32) -> Vec<u8> {
     rgba
 }
 
-/// A Windows .ico of the mark at the sizes Explorer asks for, as uncompressed 32-bit DIBs.
 fn ico() -> Vec<u8> {
     const SIZES: [u32; 6] = [16, 24, 32, 48, 64, 256];
     let mut images = Vec::new();
@@ -516,7 +597,12 @@ fn load_look() -> Look {
             "sharpen" => look.sharpen = value.clamp(0.0, 1.5),
             "vsr_quality" => look.vsr_quality = (value as u32).min(23),
             "vsr_strength" => look.vsr_strength = value.clamp(0.0, 1.0),
-            "denoise" => look.denoise = value as u32,
+            // Anything outside NVIDIA's denoise levels is off, which is how the pipeline reads it.
+            "denoise" => {
+                look.denoise = Some(value as u32)
+                    .filter(|d| (8..=11).contains(d))
+                    .unwrap_or(0);
+            }
             "fix_pixels" => look.fix_pixels = value != 0.0,
             "fit" => look.fit = value != 0.0,
             "smooth" => look.smooth = value != 0.0,

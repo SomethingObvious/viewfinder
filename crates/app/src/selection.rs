@@ -1,5 +1,4 @@
-//! The camera to use, kept in `%APPDATA%\Viewfinder\camera.txt` with the model name the
-//! virtual camera is called after.
+//! The camera to use and the model the virtual camera is named after.
 
 use capture::Choice;
 
@@ -9,7 +8,7 @@ fn read() -> String {
     store::read("camera.txt").unwrap_or_default()
 }
 
-/// The `model` line, or a bare name on the first line as older files hold.
+/// Older files hold a bare name on the first line.
 fn model_in(text: &str) -> &str {
     text.lines()
         .find_map(|l| l.strip_prefix("model="))
@@ -18,15 +17,25 @@ fn model_in(text: &str) -> &str {
         .trim()
 }
 
+/// What camera.txt can hold of a model's name. It comes from the camera, so a line break in it
+/// can't add lines of its own.
+fn clean(model: &str) -> String {
+    model
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect::<String>()
+        .trim()
+        .to_owned()
+}
+
 fn text(model: &str, choice: &Choice) -> String {
-    format!("model={model}\n{}", choice.lines())
+    format!("model={}\n{}", clean(model), choice.lines())
 }
 
 fn write(model: &str, choice: &Choice) -> bool {
     store::write("camera.txt", &text(model, choice))
 }
 
-/// The chosen camera, the Canon when there's no file.
 pub(crate) fn load() -> Choice {
     Choice::read(&read())
 }
@@ -35,15 +44,14 @@ pub(crate) fn save(choice: &Choice) {
     write(model_in(&read()), choice);
 }
 
-/// The model of the camera last opened, or empty before one has been.
 pub(crate) fn model() -> String {
     model_in(&read()).to_owned()
 }
 
-/// Saves the model of the camera just opened. True if the file changed.
+/// True if the file changed.
 pub(crate) fn save_model(model: &str) -> bool {
     let old = read();
-    model_in(&old) != model && write(model, &Choice::read(&old))
+    model_in(&old) != clean(model) && write(model, &Choice::read(&old))
 }
 
 #[cfg(test)]

@@ -1,5 +1,4 @@
-//! Drives the source in-process through a source reader, the way an app sees
-//! it behind Frame Server, without going near Frame Server or any camera.
+//! Drives the source in process through a source reader, without Frame Server or a camera.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -16,7 +15,7 @@ use windows_core::{GUID, IUnknown, Interface};
 
 const STREAM: u32 = MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32;
 
-/// Frame `k` of the test pattern. Byte 0 is `k`, so a frame names itself.
+/// Byte 0 is `k`, so a frame names itself.
 fn fill(buf: &mut [u8], k: u8) {
     for (i, b) in buf.iter_mut().enumerate() {
         *b = (i % 251) as u8 ^ k;
@@ -39,12 +38,11 @@ fn is_placeholder(buf: &[u8], f: Format) -> bool {
     }
 }
 
-/// The value `MF_MT_FRAME_SIZE` holds, width in the high half.
 fn frame_size(width: u32, height: u32) -> u64 {
     (u64::from(width) << 32) | u64::from(height)
 }
 
-/// Plays the app: writes whatever format the camera asks for, about 100 fps.
+/// Plays the app at about 100 fps.
 #[expect(
     clippy::disallowed_methods,
     reason = "a test producer thread, not the UI thread"
@@ -81,8 +79,7 @@ fn read(reader: &IMFSourceReader) -> windows_core::Result<(i64, Vec<u8>)> {
             )?;
         }
         let Some(sample) = sample else { continue };
-        // SAFETY: the slice covers only the `len` bytes Lock reported, and it is copied out
-        // before Unlock.
+        // SAFETY: the slice covers the `len` locked bytes and is copied out before Unlock.
         unsafe {
             let time = sample.GetSampleTime()?;
             assert_eq!(sample.GetSampleDuration()?, 333_333);
@@ -104,8 +101,7 @@ fn reader_for(source: &IMFMediaSource, f: Format) -> windows_core::Result<IMFSou
         MFVideoFormat_NV12
     };
     let size = frame_size(f.width, f.height);
-    // SAFETY: plain COM calls on a source and reader that Media Foundation made, with no raw
-    // pointers.
+    // SAFETY: plain COM calls with no raw pointers.
     unsafe {
         let reader = MFCreateSourceReaderFromMediaSource(source, None)?;
         let mut index = 0;
@@ -122,12 +118,10 @@ fn reader_for(source: &IMFMediaSource, f: Format) -> windows_core::Result<IMFSou
     }
 }
 
-/// Gets the class factory from the DLL and makes an activation object with it.
 #[expect(unsafe_code, reason = "the DLL entry point and COM calls are unsafe")]
 fn activation() -> windows_core::Result<(IClassFactory, IMFActivate)> {
     let mut factory = None;
-    // SAFETY: the out pointer is a live `Option<IClassFactory>`, which has the layout of the
-    // interface pointer DllGetClassObject writes.
+    // SAFETY: a live `Option<IClassFactory>` has the layout of the pointer written.
     let hr = unsafe {
         DllGetClassObject(
             &shared::CLSID,
@@ -142,11 +136,9 @@ fn activation() -> windows_core::Result<(IClassFactory, IMFActivate)> {
     Ok((factory, activate))
 }
 
-/// The parts Frame Server pokes at before streaming.
 #[expect(unsafe_code, reason = "Media Foundation is a COM API")]
 fn check_frame_server_parts(source: &IMFMediaSourceEx) -> windows_core::Result<()> {
-    // SAFETY: KsProperty gets a valid identifier with its true size, no buffer with a zero
-    // length, and an out pointer to a live local. The rest are plain COM calls.
+    // SAFETY: KsProperty gets a valid identifier, no buffer and a live out slot.
     unsafe {
         let ks: IKsControl = source.cast()?;
         let mut got = 0;
@@ -188,10 +180,9 @@ fn check_frame_server_parts(source: &IMFMediaSourceEx) -> windows_core::Result<(
     Ok(())
 }
 
-/// The types the source offers, best first.
 #[expect(unsafe_code, reason = "Media Foundation is a COM API")]
 fn check_native_types(reader: &IMFSourceReader) -> windows_core::Result<()> {
-    // SAFETY: plain COM calls on a reader that Media Foundation made, with no raw pointers.
+    // SAFETY: plain COM calls with no raw pointers.
     unsafe {
         let types: Vec<_> = (0..)
             .map_while(|i| reader.GetNativeMediaType(STREAM, i).ok())
@@ -217,7 +208,6 @@ fn check_native_types(reader: &IMFSourceReader) -> windows_core::Result<()> {
     Ok(())
 }
 
-/// Thirty frames from a busy app arrive a frame time apart and nearly all live.
 fn check_paced_frames(reader: &IMFSourceReader, nv12: Format) -> windows_core::Result<()> {
     let started = Instant::now();
     let frames = (0..30)
@@ -246,7 +236,6 @@ fn check_paced_frames(reader: &IMFSourceReader, nv12: Format) -> windows_core::R
         steps.iter().all(|&s| (330_000..=340_000).contains(&s)),
         "{steps:?}"
     );
-    // The reader may have fetched one ahead before the app started.
     assert!(
         frames
             .iter()
@@ -256,7 +245,6 @@ fn check_paced_frames(reader: &IMFSourceReader, nv12: Format) -> windows_core::R
     Ok(())
 }
 
-/// Once the app goes quiet the last frame repeats, then the placeholder comes back.
 fn check_quiet(reader: &IMFSourceReader, nv12: Format) -> windows_core::Result<()> {
     let silent = Instant::now();
     let mut repeats = Vec::new();
@@ -286,10 +274,9 @@ fn check_quiet(reader: &IMFSourceReader, nv12: Format) -> windows_core::Result<(
     Ok(())
 }
 
-/// After the reader is released, every call on the source says it has shut down.
 #[expect(unsafe_code, reason = "Media Foundation is a COM API")]
 fn check_shut_down(source: &IMFMediaSourceEx) {
-    // SAFETY: plain COM calls on a source that Media Foundation made, with no raw pointers.
+    // SAFETY: plain COM calls with no raw pointers.
     unsafe {
         assert_eq!(
             source.GetCharacteristics().err().map(|e| e.code()),
@@ -309,7 +296,6 @@ fn check_shut_down(source: &IMFMediaSourceEx) {
     }
 }
 
-/// A fresh activation negotiates YUY2, and its first frame has the YUY2 size.
 #[expect(unsafe_code, reason = "Media Foundation is a COM API")]
 fn open_yuy2(
     activate: &IMFActivate,
@@ -330,6 +316,9 @@ fn open_yuy2(
     reason = "a test thread, not the UI thread"
 )]
 fn serves_paced_frames_from_shared_memory() {
+    // SAFETY: the only test here, so nothing else reads the environment yet. The DLL and
+    // `Shared` read the name, so the installed app's buffer is never touched.
+    unsafe { std::env::set_var("VIEWFINDER_SHARED", "Viewfinder-test") };
     // SAFETY: called once on the test thread before any other COM or Media Foundation call.
     unsafe {
         CoInitializeEx(None, COINIT_MULTITHREADED).ok().unwrap();
@@ -348,7 +337,6 @@ fn serves_paced_frames_from_shared_memory() {
     let reader = reader_for(&source.cast().unwrap(), nv12).unwrap();
     check_native_types(&reader).unwrap();
 
-    // Nothing has written yet, so the first frame is the placeholder.
     let (_, first) = read(&reader).unwrap();
     assert_eq!(first.len(), nv12.bytes());
     assert!(is_placeholder(&first, nv12));
@@ -360,19 +348,16 @@ fn serves_paced_frames_from_shared_memory() {
     std::thread::sleep(Duration::from_millis(50));
     check_paced_frames(&reader, nv12).unwrap();
 
-    // The app goes quiet. The last frame repeats, then the placeholder.
     stop.store(true, Ordering::Relaxed);
     producer.join().unwrap();
     check_quiet(&reader, nv12).unwrap();
 
-    // Releasing the reader shuts the source down.
     drop(reader);
     check_shut_down(&source);
     assert_eq!(app.wanted(1000), None);
     drop(source);
-    // The mapping's DACL only lets the interactive user read and write, so
-    // a source running as that user can't reopen it the way Frame Server's
-    // LOCAL SERVICE can. Let it go so the next source makes a new one.
+    // The DACL stops a source running as the user reopening the mapping, as Frame Server's
+    // LOCAL SERVICE can, so the next source makes a new one.
     drop(app);
 
     let yuy2 = Format {
@@ -396,8 +381,7 @@ fn serves_paced_frames_from_shared_memory() {
     stop.store(true, Ordering::Relaxed);
     producer.join().unwrap();
 
-    // SAFETY: plain COM calls on a source that Media Foundation made, and MFShutdown matches
-    // the MFStartup at the top.
+    // SAFETY: plain COM calls, and MFShutdown pairs with the MFStartup above.
     unsafe {
         source.Shutdown().unwrap();
         assert_eq!(source.Shutdown().unwrap_err().code(), MF_E_SHUTDOWN);
@@ -405,6 +389,5 @@ fn serves_paced_frames_from_shared_memory() {
         MFShutdown().unwrap();
     }
     assert_eq!(DllCanUnloadNow(), S_OK);
-    // The app side keeps its buffer open through the shutdown, as a running Viewfinder would.
     drop(app);
 }
