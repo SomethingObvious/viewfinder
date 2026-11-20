@@ -1,16 +1,16 @@
 [workspace]
 resolver = "3"
-members = ["app", "canon", "shared", "vcam", "vsr"]
+members = ["crates/*"]
 
 [workspace.package]
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
 rust-version = "1.98"
 license = "MIT"
 publish = false
 
 [workspace.dependencies]
-shared = { path = "shared", version = "0.1.0" }
+shared = { path = "crates/shared", version = "1.0.0" }
 windows-core = "0.62"
 windows = { version = "0.62", features = [
     "Win32_Foundation",
@@ -21,14 +21,12 @@ windows = { version = "0.62", features = [
     "Win32_System_Threading",
 ] }
 
-# The strictest set across Valorant-Overseer and afterimage, read by every
-# crate through `[lints] workspace = true`. A lint that is wrong in one place
-# gets `#[expect(lint, reason = "...")]` on that item, never `#[allow]`.
+# A lint that is wrong in one place gets `#[expect(lint, reason = "...")]` on
+# that item, never `#[allow]`.
 
 [workspace.lints.rust]
-# Denied rather than forbidden, since forbid can't be lifted for one item and
-# every crate here calls COM, Media Foundation, WPD or CUDA. Each item that
-# needs `unsafe` says so with an `#[expect]`.
+# Denied rather than forbidden, since every crate here calls COM, Media
+# Foundation, WPD or CUDA and forbid can't be lifted for one item.
 unsafe_code = "deny"
 unsafe_op_in_unsafe_fn = "deny"
 missing_docs = "deny"
@@ -96,14 +94,9 @@ unnecessary_self_imports = "deny"
 allow_attributes = "deny"
 allow_attributes_without_reason = "deny"
 
-# The relaxations both sibling repositories make, for the same reasons.
-#
-# `unreachable_pub` wants `pub(crate)` in a binary and this wants `pub` inside
-# a private module, so the two can't both hold. `unreachable_pub` catches the
-# real mistake.
+# Contradicts `unreachable_pub`, which catches the real mistake.
 redundant_pub_crate = "allow"
-# Duplicate versions deep in eframe, wgpu and tray-icon, none of which this
-# workspace can unify. `cargo deny` checks duplicates instead, naming each one it lets through.
+# Duplicates deep in eframe, wgpu and tray-icon. `cargo deny` checks them instead.
 multiple_crate_versions = "allow"
 # Pixel, size and timing maths. A float to an integer has no other conversion
 # than `as`, and `From` doesn't exist for most integer to float pairs.

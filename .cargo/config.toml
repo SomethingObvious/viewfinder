@@ -1,3 +1,7 @@
 # The DLL loads into Frame Server, so it should not depend on a VC++ runtime being installed.
 [target.x86_64-pc-windows-msvc]
 rustflags = ["-C", "target-feature=+crt-static"]
+
+# Clippy's thresholds live in scripts with the other lint configs.
+[env]
+CLIPPY_CONF_DIR = { value = "scripts", relative = true, force = true }

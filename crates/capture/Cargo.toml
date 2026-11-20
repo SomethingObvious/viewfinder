@@ -1,0 +1,24 @@
+[package]
+name = "capture"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+canon = { path = "../canon", version = "1.0.0" }
+shared.workspace = true
+windows-core.workspace = true
+windows = { workspace = true, features = [
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Media_MediaFoundation",
+    "Win32_System_Com",
+    "Win32_System_Registry",
+] }
+
+[dev-dependencies]
+zune-jpeg = "0.5.15"
+
+[lints]
+workspace = true

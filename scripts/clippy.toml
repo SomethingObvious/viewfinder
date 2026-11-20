@@ -1,0 +1,22 @@
+cognitive-complexity-threshold = 15
+too-many-arguments-threshold = 6
+too-many-lines-threshold = 80
+type-complexity-threshold = 200
+enum-variant-name-threshold = 2
+avoid-breaking-exported-api = false
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-dbg-in-tests = false
+
+disallowed-methods = [
+  { path = "std::path::Path::to_str", reason = "returns None on a non-UTF-8 path, so a real file reads as a missing one", replacement = "std::path::Path::display" },
+  { path = "std::fs::canonicalize", reason = "on Windows it returns an extended-length path that many APIs and log readers mishandle" },
+  { path = "std::thread::sleep", reason = "a UI thread that sleeps is a dropped frame, so only the camera and worker threads may wait like this" },
+]
+
+# The trailing ".." keeps clippy's own list.
+doc-valid-idents = [
+  "VideoSuperRes", "MediaFoundation", "DirectX", "YCbCr", "NV12", "RGB24", "BT.601", "BT.709",
+  "EOS", "WPD", "PTP", "CUDA", "TensorRT", "..",
+]

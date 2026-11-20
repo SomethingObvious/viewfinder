@@ -1,0 +1,15 @@
+# Domain words go here, never as an inline ignore.
+[files]
+extend-exclude = ["*.lock"]
+
+[default.extend-words]
+# Plug and Play, as in PnP ids.
+pn = "pn"
+# BUILTIN\Administrators in SDDL.
+ba = "ba"
+# The flate2 crate.
+flate = "flate"
+# Win32 TrackMouseEvent flags, as in TME_LEAVE.
+tme = "tme"
+# Canon's Auto Lighting Optimizer, as in AloMode.
+alo = "alo"

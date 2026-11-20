@@ -1,0 +1,9 @@
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Build output is not source"
+paths = [
+  # Cargo's build directory isn't tracked, and muda's metadata has strings that read as keys.
+  '''^target/''',
+]

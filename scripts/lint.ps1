@@ -82,7 +82,7 @@ $Suppressions = '#!?\[\s*(cfg_attr\(.*)?allow\s*\(' +
 '|typos:\s*(off|ignore|disable)' +
 '|gitleaks:allow'
 
-# A config file below the root would quietly loosen the rules for its folder.
+# A config file anywhere but its home would quietly loosen the rules for its folder.
 $ConfigNames = @('clippy.toml', '.clippy.toml', 'rustfmt.toml', '.rustfmt.toml', 'deny.toml',
     '.typos.toml', '_typos.toml', 'typos.toml', '.editorconfig', '.gitleaks.toml',
     '.markdownlint-cli2.yaml', '.markdownlint-cli2.jsonc', '.markdownlint.yaml',
@@ -91,6 +91,12 @@ $ConfigNames = @('clippy.toml', '.clippy.toml', 'rustfmt.toml', '.rustfmt.toml',
 $ConfigHomes = @{
     'config.toml'                   = '.cargo'
     'PSScriptAnalyzerSettings.psd1' = 'scripts'
+    'clippy.toml'                   = 'scripts'
+    'rustfmt.toml'                  = 'scripts'
+    'deny.toml'                     = 'scripts'
+    '.typos.toml'                   = 'scripts'
+    '.gitleaks.toml'                = 'scripts'
+    '.markdownlint-cli2.yaml'       = 'scripts'
 }
 
 function Test-NoNestedConfig {
@@ -105,7 +111,7 @@ function Test-NoNestedConfig {
         $hits += $file.FullName.Substring($Root.Length).TrimStart('\')
     }
     if ($hits.Count -eq 0) { return $true }
-    Write-Host '  x lint config belongs at the root, and these are elsewhere:' -ForegroundColor Red
+    Write-Host '  x lint config belongs at the root or in scripts, and these are elsewhere:' -ForegroundColor Red
     foreach ($h in $hits) { Write-Host "      $h" -ForegroundColor Red }
     return $false
 }
@@ -206,20 +212,20 @@ Invoke-Step 'nothing that emails anybody' {
 }
 Invoke-Step 'encodings' { Test-Encoding }
 Invoke-Step 'editorconfig' { Invoke-Native 'ec' @() }
-Invoke-Step 'rustfmt' { Invoke-Native 'cargo' @('fmt', '--all', '--check') }
+Invoke-Step 'rustfmt' { Invoke-Native 'cargo' @('fmt', '--all', '--check', '--', '--config-path', 'scripts\rustfmt.toml') }
 Invoke-Step 'clippy' {
     Invoke-Native 'cargo' @('clippy', '--workspace', '--all-targets', '--all-features', '--locked',
         '--', '-D', 'warnings')
 }
 Invoke-Step 'rustdoc' { Invoke-CargoDoc }
-Invoke-Step 'cargo deny' { Invoke-Native 'cargo-deny' @('check') }
+Invoke-Step 'cargo deny' { Invoke-Native 'cargo-deny' @('--config', 'scripts\deny.toml', 'check') }
 Invoke-Step 'unused dependencies' { Invoke-Native 'cargo-machete' @() }
 Invoke-Step 'PSScriptAnalyzer' { Invoke-ScriptAnalyzerCheck }
-Invoke-Step 'markdownlint' { Invoke-Native 'markdownlint-cli2' @() }
-Invoke-Step 'typos' { Invoke-Native 'typos' @() }
+Invoke-Step 'markdownlint' { Invoke-Native 'markdownlint-cli2' @('--config', 'scripts\.markdownlint-cli2.yaml') }
+Invoke-Step 'typos' { Invoke-Native 'typos' @('--config', 'scripts\.typos.toml') }
 Invoke-Step 'gitleaks' {
-    $dir = Invoke-Native 'gitleaks' @('dir', '--no-banner', '--redact', '--exit-code', '1', '-c', '.gitleaks.toml', '.')
-    $git = Invoke-Native 'gitleaks' @('git', '--no-banner', '--redact', '--exit-code', '1', '-c', '.gitleaks.toml', '.')
+    $dir = Invoke-Native 'gitleaks' @('dir', '--no-banner', '--redact', '--exit-code', '1', '-c', 'scripts\.gitleaks.toml', '.')
+    $git = Invoke-Native 'gitleaks' @('git', '--no-banner', '--redact', '--exit-code', '1', '-c', 'scripts\.gitleaks.toml', '.')
     $dir -and $git
 }
 if (-not $NoTests) {

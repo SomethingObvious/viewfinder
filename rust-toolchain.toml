@@ -1,5 +1,4 @@
-# Pinned so a lint can't appear or vanish without a change here. The same
-# channel Valorant-Overseer and afterimage use, so one install serves all three.
+# Pinned so a lint can't appear or vanish without a change here.
 [toolchain]
 channel = "1.98.0"
 components = ["clippy", "rustfmt", "rust-src"]
