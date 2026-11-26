@@ -229,8 +229,9 @@ Invoke-Step 'gitleaks' {
     $dir -and $git
 }
 if (-not $NoTests) {
-    # One run at a time, since the pipeline tests hold the GPU.
-    Invoke-Step 'tests' { Invoke-Native 'cargo' @('test', '--release', '--workspace', '--locked') }
+    # One test at a time, since the pipeline tests hold the GPU and the frame budget tests time
+    # themselves, which fails with other tests running beside them.
+    Invoke-Step 'tests' { Invoke-Native 'cargo' @('test', '--release', '--workspace', '--locked', '--', '--test-threads=1') }
 }
 
 Write-Host ''

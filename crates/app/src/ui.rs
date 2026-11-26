@@ -914,7 +914,7 @@ impl eframe::App for App {
             ctx.request_repaint();
         } else if self.cloaked
             && !self.start_hidden
-            && let Some(hwnd) = hwnd(frame).filter(|_| !on_screen(frame))
+            && let Some(hwnd) = hwnd(frame)
         {
             cloak(hwnd, false);
             self.cloaked = false;
@@ -938,7 +938,13 @@ impl eframe::App for App {
             self.image = Arc::default();
             return;
         }
-        self.want_preview(on_screen(frame) && !self.cloaked);
+        let shown = on_screen(frame) && !self.cloaked;
+        self.want_preview(shown);
+        // The usage readings come from their own thread, so the window looks for the next one
+        // itself. eframe still runs this while the window is hidden, so only when it shows.
+        if shown {
+            ctx.request_repaint_after(crate::usage::EVERY);
+        }
         self.follow_system(&ctx);
         self.draw(ui);
     }

@@ -1043,8 +1043,6 @@ fn budget(ui: &Ui, rect: Rect, stages: [f32; 4], total: f32, peak: f32) {
 }
 
 fn usage_strip(ui: &Ui, rect: Rect) {
-    // The readings come from their own thread, so the strip looks for the next one itself.
-    ui.ctx().request_repaint_after(usage::EVERY);
     let Some(meters) = lock(&usage::LATEST).as_ref().map(usage::Usage::meters) else {
         return;
     };
