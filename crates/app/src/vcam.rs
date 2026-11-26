@@ -20,7 +20,7 @@ use windows::Win32::Media::MediaFoundation::{
     IMFVirtualCamera, MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_SYMBOLIC_LINK, MF_VERSION,
     MFCreateVirtualCamera, MFSTARTUP_FULL, MFShutdown, MFStartup,
     MFVirtualCameraAccess_CurrentUser, MFVirtualCameraLifetime_Session,
-    MFVirtualCameraType_SoftwareCameraSource,
+    MFVirtualCameraLifetime_System, MFVirtualCameraType_SoftwareCameraSource,
 };
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::System::Registry::{HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ, RegGetValueW};
@@ -37,26 +37,53 @@ const CAMERA_CLASSES: &[GUID] = &[
     GUID::from_u128(0x6994ad05_93ef_11d0_a3cc_00a0c9223196),
 ];
 
+/// The camera stays after Viewfinder quits, as Windows deletes the settings it keeps for a camera,
+/// such as letting several apps share it, along with the camera. Its device ID comes from the
+/// name it's made with, so that name never changes and the rename adds the model, or a new
+/// camera body would leave the old one listed.
+#[expect(
+    unsafe_code,
+    reason = "making the virtual camera is a Media Foundation call"
+)]
+fn create() -> windows_core::Result<IMFVirtualCamera> {
+    // SAFETY: the strings are live HSTRINGs for the length of the call.
+    unsafe {
+        MFCreateVirtualCamera(
+            MFVirtualCameraType_SoftwareCameraSource,
+            MFVirtualCameraLifetime_System,
+            MFVirtualCameraAccess_CurrentUser,
+            &HSTRING::from("Viewfinder"),
+            &HSTRING::from(shared::CLSID_STR),
+            None,
+        )
+    }
+}
+
+/// Takes the camera off the system, for uninstalling.
+#[expect(
+    unsafe_code,
+    reason = "removing the virtual camera is a Media Foundation call"
+)]
+pub(crate) fn remove() -> Result<(), String> {
+    crate::mta();
+    // SAFETY: the thread is in the MTA, and the camera was just made.
+    unsafe {
+        MFStartup(MF_VERSION, MFSTARTUP_FULL)
+            .and_then(|()| create())
+            .and_then(|c| c.Remove())
+    }
+    .map_err(|e| format!("Windows refused to remove the camera ({e})"))
+}
+
 pub(crate) struct VirtualCamera(IMFVirtualCamera);
 
 impl VirtualCamera {
     #[expect(
         unsafe_code,
-        reason = "making the virtual camera is a Media Foundation call"
+        reason = "starting the virtual camera is a Media Foundation call"
     )]
     pub(crate) fn start() -> Result<Self, String> {
-        // SAFETY: the strings are live HSTRINGs for the length of the call.
-        let camera = unsafe {
-            MFCreateVirtualCamera(
-                MFVirtualCameraType_SoftwareCameraSource,
-                MFVirtualCameraLifetime_Session,
-                MFVirtualCameraAccess_CurrentUser,
-                &HSTRING::from(name()),
-                &HSTRING::from(shared::CLSID_STR),
-                None,
-            )
-        }
-        .map_err(|e| format!("Windows refused to create the camera ({e})"))?;
+        let camera = create().map_err(|e| format!("Windows refused to create the camera ({e})"))?;
         // Wrapped first, so a camera that fails to start is still shut down before release.
         let camera = Self(camera);
         // SAFETY: the camera was just created, and no callback is passed.
@@ -74,9 +101,10 @@ impl VirtualCamera {
 impl Drop for VirtualCamera {
     #[expect(
         unsafe_code,
-        reason = "removing the virtual camera is a Media Foundation call"
+        reason = "letting go of the virtual camera is a Media Foundation call"
     )]
     fn drop(&mut self) {
+        // The camera stays on the system, and apps get a dark grey frame until Viewfinder is back.
         // SAFETY: the camera is live, and nothing uses it after drop.
         unsafe { self.0.Shutdown().ok() };
     }

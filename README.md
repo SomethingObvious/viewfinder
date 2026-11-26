@@ -27,7 +27,9 @@ A free webcam app that turns a Canon EOS Rebel T3 into a Windows 11 webcam, a ca
 4. With an NVIDIA RTX card, press Download to get NVIDIA's Video Effects (about 436 MB), then Restart Viewfinder.
 5. Turn the camera on with the mode dial on P, Tv, Av or M, and plug it in over USB. Quit EOS Utility if it opens, since only one program can use the camera at a time.
 
-Then pick Viewfinder in your call app's camera list. Setup stays in General if anything changes later.
+Then pick Viewfinder in your call app's camera list. Setup stays in General if anything changes later. The camera stays in that list while Viewfinder is closed and shows dark grey until it opens again.
+
+Windows lets only one app use a camera at a time. To have a call and OBS both use Viewfinder, open Settings, then Bluetooth & Devices, Cameras, Viewfinder and Advanced Camera Options, and turn on Allow Multiple Apps to Use Camera at the Same Time. Windows remembers that for as long as Viewfinder is installed.
 
 ![Setup checking the virtual camera, the camera, other programs, the mode dial and NVIDIA's Video Effects](docs/img/setup.webp)
 

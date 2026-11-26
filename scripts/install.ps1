@@ -57,6 +57,11 @@ if ($Uninstall) {
     foreach ($name in $task, $start) {
         Unregister-ScheduledTask -TaskName $name -Confirm:$false -ErrorAction SilentlyContinue
     }
+    # The camera outlives the app, so it's taken off before the DLL it runs goes. Windows only
+    # lets the account that made it do that, so an administrator uninstalling for someone else
+    # leaves a camera behind that no longer opens.
+    $installed = Join-Path $dest 'viewfinder.exe'
+    if (Test-Path -LiteralPath $installed) { Start-Process $installed -ArgumentList '--remove-camera' -Wait }
     Remove-Item $key, $owner -Recurse -ErrorAction SilentlyContinue
     Remove-Item $dest, $old -Recurse -ErrorAction SilentlyContinue
     # NVIDIA's Video Effects, where Setup in the app downloads them.

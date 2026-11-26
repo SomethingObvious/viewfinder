@@ -81,6 +81,10 @@ pub(crate) struct App {
     /// Listed off the UI thread, since Windows can be slow to list devices.
     listing: Option<Receiver<Vec<capture::Choice>>>,
     rounded: bool,
+    /// Started with --background. eframe shows the window after its first paint whatever it
+    /// was built with, so the window stays cloaked until it's hidden again.
+    start_hidden: bool,
+    cloaked: bool,
     still_image: Arc<ColorImage>,
     bus: switcher::Bus,
     system_checked: f64,
@@ -149,6 +153,8 @@ impl App {
             listed: None,
             listing: None,
             rounded: false,
+            start_hidden: !visible,
+            cloaked: false,
             still_image: Arc::default(),
             bus: switcher::Bus::default(),
             system_checked: f64::NEG_INFINITY,
@@ -891,6 +897,10 @@ impl eframe::App for App {
             && let Some(hwnd) = hwnd(frame)
         {
             self.rounded = true;
+            if self.start_hidden {
+                cloak(hwnd, true);
+                self.cloaked = true;
+            }
             round_corners(hwnd);
             chrome::install(hwnd, ctx);
             let place = lock(&self.hub.general).window;
@@ -898,9 +908,18 @@ impl eframe::App for App {
                 restore_place(hwnd, place);
             }
         }
-        self.hub
-            .preview_wanted
-            .store(on_screen(frame), Ordering::Relaxed);
+        if self.start_hidden && on_screen(frame) {
+            self.start_hidden = false;
+            ctx.send_viewport_cmd(ViewportCommand::Visible(false));
+            ctx.request_repaint();
+        } else if self.cloaked
+            && !self.start_hidden
+            && let Some(hwnd) = hwnd(frame).filter(|_| !on_screen(frame))
+        {
+            cloak(hwnd, false);
+            self.cloaked = false;
+        }
+        self.want_preview(on_screen(frame) && !self.cloaked);
         self.follow_prefs(ctx, frame);
     }
 
@@ -919,15 +938,20 @@ impl eframe::App for App {
             self.image = Arc::default();
             return;
         }
-        self.hub
-            .preview_wanted
-            .store(on_screen(frame), Ordering::Relaxed);
+        self.want_preview(on_screen(frame) && !self.cloaked);
         self.follow_system(&ctx);
         self.draw(ui);
     }
 }
 
 impl App {
+    fn want_preview(&self, on: bool) {
+        self.hub.preview_wanted.store(on, Ordering::Relaxed);
+        if on {
+            crate::usage::wake();
+        }
+    }
+
     fn follow_prefs(&mut self, ctx: &Context, frame: &eframe::Frame) {
         let prefs = *lock(&self.hub.general);
         if self.on_top != Some(prefs.on_top) {
@@ -1237,6 +1261,23 @@ fn restore_place(hwnd: HWND, [left, top, right, bottom]: [i32; 4]) {
     };
     // SAFETY: `place` is a filled-in WINDOWPLACEMENT that outlives the call.
     unsafe { SetWindowPlacement(hwnd, &raw const place) }.ok();
+}
+
+/// A cloaked window is drawn but never put on screen.
+#[expect(unsafe_code, reason = "cloaking a window is a DWM call")]
+fn cloak(hwnd: HWND, on: bool) {
+    use windows::Win32::Graphics::Dwm::{DWMWA_CLOAK, DwmSetWindowAttribute};
+    let value = i32::from(on);
+    // SAFETY: the pointer and size describe `value`, a BOOL that outlives the call.
+    unsafe {
+        DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_CLOAK,
+            std::ptr::from_ref(&value).cast(),
+            size_of_val(&value) as u32,
+        )
+    }
+    .ok();
 }
 
 /// Windows 11 rounds a window's corners only when it has the system frame, so ask for it.

@@ -149,6 +149,13 @@ fn run_command(args: &[String]) -> Option<eframe::Result> {
         }
         return Some(Ok(()));
     }
+    if args.iter().any(|a| a == "--remove-camera") {
+        if let Err(e) = vcam::remove() {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+        return Some(Ok(()));
+    }
     if args.iter().any(|a| a == "--demo") {
         return Some(ui::demo::run());
     }

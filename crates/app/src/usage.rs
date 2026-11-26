@@ -1,5 +1,5 @@
-//! CPU, RAM and NVIDIA GPU use, read four times a second while the window shows. The GPU numbers are
-//! the counters Task Manager reads.
+//! CPU, RAM and NVIDIA GPU use, read eight times a second while the window shows. The GPU
+//! numbers are the counters Task Manager reads.
 
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
@@ -123,6 +123,18 @@ pub(crate) fn nvidia() -> Option<&'static Card> {
     .as_ref()
 }
 
+/// How often a reading is taken while the window shows.
+pub(crate) const EVERY: Duration = Duration::from_millis(125);
+
+static THREAD: OnceLock<thread::Thread> = OnceLock::new();
+
+/// Starts the readings again once the window is on screen.
+pub(crate) fn wake() {
+    if let Some(t) = THREAD.get() {
+        t.unpark();
+    }
+}
+
 pub(crate) fn spawn(hub: Arc<Hub>) {
     thread::Builder::new()
         .name("usage".into())
@@ -132,19 +144,23 @@ pub(crate) fn spawn(hub: Arc<Hub>) {
 
 #[expect(
     clippy::disallowed_methods,
-    reason = "a thread of its own that reads four times a second"
+    reason = "a thread of its own that reads eight times a second"
 )]
 fn run(hub: &Hub) {
+    THREAD.set(thread::current()).ok();
     let luid = nvidia().map(|c| c.luid.as_str());
     let pdh = Pdh::open();
     let pid = format!("pid_{}_", std::process::id());
     let mut last = times();
     let mut logged = false;
     loop {
-        thread::sleep(Duration::from_millis(250));
         if !hub.preview_wanted.load(Ordering::Relaxed) {
+            // Sleeps until the window is back, so nothing runs while it's hidden.
+            thread::park();
+            last = times();
             continue;
         }
+        thread::sleep(EVERY);
         let start = Instant::now();
         let now = times();
         let (cpu, cpu_own) = cpu_percent(last, now);

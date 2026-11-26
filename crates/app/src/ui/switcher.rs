@@ -1043,6 +1043,8 @@ fn budget(ui: &Ui, rect: Rect, stages: [f32; 4], total: f32, peak: f32) {
 }
 
 fn usage_strip(ui: &Ui, rect: Rect) {
+    // The readings come from their own thread, so the strip looks for the next one itself.
+    ui.ctx().request_repaint_after(usage::EVERY);
     let Some(meters) = lock(&usage::LATEST).as_ref().map(usage::Usage::meters) else {
         return;
     };
@@ -1114,10 +1116,10 @@ fn budget_words(stages: [f32; 4], total: f32) -> String {
 }
 
 /// Glides over one reading, so a usage bar climbs and falls instead of stepping. egui's own
-/// animation would redraw at the monitor's rate, and with a reading every 250 ms it would never
+/// animation would redraw at the monitor's rate, and with a reading every 125 ms it would never
 /// stop, so this asks for 30 fps. With Windows animations off it jumps.
 fn glide(ctx: &egui::Context, id: Id, target: f32) -> f32 {
-    const SECONDS: f64 = 0.25;
+    const SECONDS: f64 = 0.125;
     if ctx.global_style().animation_time <= 0.0 {
         return target;
     }
@@ -1416,7 +1418,7 @@ mod tests {
         let ctx = eframe::egui::Context::default();
         let id = eframe::egui::Id::unique("bar");
         let mut seen = Vec::new();
-        for (time, target) in [(0.0, 0.2), (1.0, 0.8), (1.125, 0.8), (1.5, 0.8)] {
+        for (time, target) in [(0.0, 0.2), (1.0, 0.8), (1.0625, 0.8), (1.5, 0.8)] {
             let input = eframe::egui::RawInput {
                 time: Some(time),
                 ..Default::default()
