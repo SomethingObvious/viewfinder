@@ -7,7 +7,7 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
-canon = { path = "../canon", version = "1.0.0" }
+canon = { path = "../canon", version = "1.1.0" }
 shared.workspace = true
 windows-core.workspace = true
 windows = { workspace = true, features = [
