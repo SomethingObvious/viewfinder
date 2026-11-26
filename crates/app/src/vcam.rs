@@ -17,8 +17,9 @@ use windows::Win32::Devices::Properties::{
 };
 use windows::Win32::Foundation::DEVPROPKEY;
 use windows::Win32::Media::MediaFoundation::{
-    IMFVirtualCamera, MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_SYMBOLIC_LINK,
-    MFCreateVirtualCamera, MFVirtualCameraAccess_CurrentUser, MFVirtualCameraLifetime_Session,
+    IMFVirtualCamera, MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_SYMBOLIC_LINK, MF_VERSION,
+    MFCreateVirtualCamera, MFSTARTUP_FULL, MFShutdown, MFStartup,
+    MFVirtualCameraAccess_CurrentUser, MFVirtualCameraLifetime_Session,
     MFVirtualCameraType_SoftwareCameraSource,
 };
 use windows::Win32::System::Com::CoTaskMemFree;
@@ -109,6 +110,75 @@ fn rename() {
         .stderr(std::process::Stdio::null())
         .spawn()
         .ok();
+    std::thread::Builder::new()
+        .name("vcam refresh".into())
+        .spawn(refresh)
+        .ok();
+}
+
+/// Chrome reads a camera's Media Foundation name and then its older names, merges them only when
+/// they match, and keeps the list until a camera comes or goes. Reading across the rename leaves
+/// the camera listed twice, so once every name has changed a stand-in camera comes and goes to
+/// make apps list their cameras again.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "runs on its own thread, waiting for the elevated rename"
+)]
+fn refresh() {
+    let name = name();
+    let Some(device) = our_link()
+        .map(|l| interface_string(&wide(&l), &DEVPKEY_Device_InstanceId))
+        .filter(|d| !d.is_empty())
+    else {
+        return;
+    };
+    // The rename runs as its own process and retries for about 12 s.
+    for _ in 0..60 {
+        std::thread::sleep(Duration::from_millis(250));
+        if named(&device, &name) {
+            stand_in();
+            return;
+        }
+    }
+}
+
+/// Whether every camera class has an interface of `device` called `name`.
+fn named(device: &str, name: &str) -> bool {
+    CAMERA_CLASSES.iter().all(|class| {
+        interfaces(class).is_ok_and(|list| {
+            list.iter().any(|p| {
+                interface_string(p, &DEVPKEY_Device_InstanceId) == device
+                    && interface_string(p, &DEVPKEY_DeviceInterface_FriendlyName) == name
+            })
+        })
+    })
+}
+
+#[expect(
+    unsafe_code,
+    reason = "making the stand-in camera is a Media Foundation call"
+)]
+fn stand_in() {
+    crate::mta();
+    // SAFETY: the thread is in the MTA, the strings live for the call, and MFShutdown pairs
+    // with the MFStartup that succeeded.
+    unsafe {
+        if MFStartup(MF_VERSION, MFSTARTUP_FULL).is_err() {
+            return;
+        }
+        if let Ok(camera) = MFCreateVirtualCamera(
+            MFVirtualCameraType_SoftwareCameraSource,
+            MFVirtualCameraLifetime_Session,
+            MFVirtualCameraAccess_CurrentUser,
+            &HSTRING::from("Viewfinder refresh"),
+            &HSTRING::from(shared::CLSID_STR),
+            None,
+        ) {
+            camera.Start(None).ok();
+            camera.Shutdown().ok();
+        }
+        MFShutdown().ok();
+    }
 }
 
 #[expect(unsafe_code, reason = "setting a device property is a Win32 call")]
@@ -118,7 +188,8 @@ fn rename() {
 )]
 pub(crate) fn name_interfaces() -> Result<usize, String> {
     let mut problem = String::new();
-    for _ in 0..10 {
+    // About 12 s, as a busy login can bring the interfaces in seconds apart.
+    for _ in 0..40 {
         let mut renamed = 0;
         // Both read each round, as the app writes them while its camera starts, and the task
         // ignores a second run while one is going.
@@ -157,8 +228,10 @@ pub(crate) fn name_interfaces() -> Result<usize, String> {
                 continue;
             }
         };
-        for path in lists.concat() {
-            let current = interface_string(&path, &DEVPKEY_DeviceInterface_FriendlyName);
+        let mut seen = [false; CAMERA_CLASSES.len()];
+        let paths = lists.iter().enumerate();
+        for (class, path) in paths.flat_map(|(i, l)| l.iter().map(move |p| (i, p))) {
+            let current = interface_string(path, &DEVPKEY_DeviceInterface_FriendlyName);
             // The path comes from a file the user can write and this can run as SYSTEM, so it
             // only ever picks out a virtual camera that's Viewfinder's or not named yet, never
             // a real webcam.
@@ -166,12 +239,12 @@ pub(crate) fn name_interfaces() -> Result<usize, String> {
             let mine = ours.as_ref().map_or(viewfinder, |device| {
                 device.starts_with(r"SWD\VCAMDEVAPI\")
                     && (viewfinder || current.is_empty())
-                    && interface_string(&path, &DEVPKEY_Device_InstanceId) == *device
+                    && interface_string(path, &DEVPKEY_Device_InstanceId) == *device
             });
             if !mine {
                 continue;
             }
-            name_device(&path, &value);
+            name_device(path, &value);
             if current != name {
                 // SAFETY: `path` is NUL-terminated and `value` outlives the call.
                 let r = unsafe {
@@ -191,11 +264,16 @@ pub(crate) fn name_interfaces() -> Result<usize, String> {
                 }
             }
             renamed += 1;
+            if let Some(s) = seen.get_mut(class) {
+                *s = true;
+            }
         }
-        if renamed > 0 {
+        // Chrome lists a camera once only while its Media Foundation and DirectShow names
+        // match, so stopping after the first class to arrive leaves it listed twice.
+        if seen.iter().all(|s| *s) {
             return Ok(renamed);
         }
-        "found no Viewfinder camera to rename".clone_into(&mut problem);
+        "some of the camera's interfaces never showed up".clone_into(&mut problem);
         std::thread::sleep(Duration::from_millis(300));
     }
     // Exits non-zero, so Task Scheduler shows why the name didn't change.
